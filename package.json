@@ -1,0 +1,13 @@
+{
+  "name": "prova-assistente",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Assistente local para ler prova propria, gerar prompt e marcar alternativas.",
+  "type": "module",
+  "scripts": {
+    "start": "node src/manual-prova-bot.js"
+  },
+  "dependencies": {
+    "playwright": "^1.52.0"
+  }
+}

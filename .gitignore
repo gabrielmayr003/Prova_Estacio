@@ -1,0 +1,15 @@
+node_modules/
+.browser-profile/
+.chrome-chatgpt-profile/
+
+prompt-prova.txt
+respostas.txt
+chatgpt-pagina.txt
+leitura-prova.json
+
+*-debug.json
+*-debug.png
+avaliacoes-*.json
+avaliacoes-*.png
+sala-*.png
+simulados-debug.png
