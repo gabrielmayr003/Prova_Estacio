@@ -11,15 +11,39 @@ const OUTPUT_FILE = path.resolve('leitura-prova.json');
 const PROMPT_FILE = path.resolve('prompt-prova.txt');
 const ANSWERS_TEXT_FILE = path.resolve('respostas.txt');
 const CHATGPT_PAGE_TEXT_FILE = path.resolve('chatgpt-pagina.txt');
-const USER_ENV_FILES = [path.resolve('user.env'), path.resolve('..', 'user.env')];
+const HOME_URL = 'https://estudante.estacio.br/inicio';
 const DEFAULT_SITE_URL = 'https://estudante.estacio.br/disciplinas';
 const EVALUATIONS_URL = 'https://estudante.estacio.br/avaliacoes';
 const CHROME_EXE = 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe';
+const CHATGPT_PROVAS_URL = 'https://chatgpt.com/c/69ff2b24-07c4-83e9-b883-9f849ee8f433';
 const VALID_LETTERS = new Set(['A', 'B', 'C', 'D', 'E']);
+const ANSWER_PROMPT_TEMPLATE = `
+Voce e um especialista em { titulo prova } e vai resolver uma avaliacao objetiva.
+
+Objetivo:
+Responder exatamente as questoes abaixo, escolhendo uma unica alternativa entre A, B, C, D ou E para cada questao.
+
+Regras obrigatorias:
+1. Comece sua resposta obrigatoriamente com uma linha neste formato exato:
+RESPOSTAS: A B C D E A B C D E
+2. A linha RESPOSTAS deve ter exatamente 10 letras, separadas por espaco, na ordem da questao 1 ate a questao 10.
+3. Nao use texto antes da linha RESPOSTAS.
+4. Use somente as letras A, B, C, D ou E na linha RESPOSTAS.
+5. Depois da linha RESPOSTAS, explique rapidamente cada escolha em uma frase curta.
+6. Se uma pergunta estiver ambigua, escolha a alternativa mais correta de acordo com o tema "{ titulo prova }" e com o enunciado.
+7. Nao invente alternativas fora das opcoes enviadas.
+
+Prova:
+{ questoes }
+`.trim();
 
 const rl = readline.createInterface({ input, output });
 
 let lastRead = null;
+let currentEvaluationIndex = 0;
+let currentExerciseTitle = '';
+
+const startMode = await askStartMode();
 
 const context = await firefox.launchPersistentContext(USER_DATA_DIR, {
   headless: false,
@@ -29,8 +53,17 @@ const context = await firefox.launchPersistentContext(USER_DATA_DIR, {
 const page = context.pages()[0] ?? await context.newPage();
 page.setDefaultTimeout(5000);
 
-await openUrl(DEFAULT_SITE_URL);
-await collectEvaluationsIfLoggedIn();
+const debugLog = () => {};
+const statusEvaluation = (status) => {
+  console.log(`Avalia\u00e7\u00e3o ${currentEvaluationIndex + 1}: ${status}.`);
+};
+
+if (startMode === 'exercicio') {
+  await openExercisesFromHome();
+} else {
+  await openUrl(DEFAULT_SITE_URL);
+  await collectEvaluationsIfLoggedIn();
+}
 printBanner();
 
 try {
@@ -51,6 +84,7 @@ try {
       if (command === 'abrir') await openUrl(args.join(' '));
       else if (command === 'site') await openUrl(args[0] ? buildExamUrl(args[0]) : DEFAULT_SITE_URL);
       else if (command === 'avaliacoes') await collectEvaluations();
+      else if (command === 'exercicio' || command === 'exercicios') await openExercisesFromHome();
       else if (command === 'prova') await openUrl(buildExamUrl(args[0] ?? ''));
       else if (command === 'ler') await readVisibleExam();
       else if (command === 'prompt') await savePromptForChat();
@@ -59,9 +93,9 @@ try {
       else if (command === 'marcar') await markOption(args);
       else if (command === 'scroll') await scrollPage(args[0]);
       else if (command === 'ir') await goToQuestion(args[0]);
-      else console.log('Comando desconhecido. Digite "ajuda" para ver as opcoes.');
+      else debugLog('Comando desconhecido. Digite "ajuda" para ver as opcoes.');
     } catch (error) {
-      console.log(`Nao consegui executar isso: ${error.message}`);
+      debugLog(`Nao consegui executar isso: ${error.message}`);
     }
   }
 } finally {
@@ -71,24 +105,37 @@ try {
 
 async function askPrompt() {
   try {
-    return await rl.question('\nprova> ');
+    return await rl.question(`\n${startMode}> `);
   } catch (error) {
     if (error?.code === 'ERR_USE_AFTER_CLOSE') return 'sair';
     throw error;
   }
 }
 
+async function askStartMode() {
+  while (true) {
+    const answer = (await rl.question('Escolha o modo (avaliacao/exercicio): ')).trim().toLowerCase();
+    const normalized = normalizeText(answer);
+
+    if (['1', 'a', 'avaliacao', 'avaliacoes'].includes(normalized)) return 'avaliacao';
+    if (['2', 'e', 'exercicio', 'exercicios'].includes(normalized)) return 'exercicio';
+
+    console.log('Digite "avaliacao" ou "exercicio".');
+  }
+}
+
 function printBanner() {
-  console.log('Assistente de prova aberto.');
-  console.log('Use apenas em provas suas ou ambientes em que voce tenha autorizacao.');
+  debugLog('Assistente de prova aberto.');
+  debugLog('Use apenas em provas suas ou ambientes em que voce tenha autorizacao.');
   printHelp();
 }
 
 function printHelp() {
-  console.log(`
+  debugLog(`
 Comandos:
   site              Abre https://estudante.estacio.br/disciplinas
   avaliacoes        Abre avaliacoes e acessa a primeira prova
+  exercicios        Abre Disciplinas e acessa o card de exercicios
   site <chave>      Abre https://estacio.saladeavaliacoes.com.br/prova/<chave>/
   prova <chave>     Abre https://estacio.saladeavaliacoes.com.br/prova/<chave>/
   abrir <url>       Abre uma URL completa
@@ -113,70 +160,291 @@ function buildExamUrl(keyOrUrl) {
   return `https://estacio.saladeavaliacoes.com.br/prova/${key}/`;
 }
 
+function normalizeText(value) {
+  return String(value || '')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .toLowerCase();
+}
+
 async function openUrl(rawUrl) {
   if (!rawUrl) throw new Error('informe uma URL');
   const url = /^https?:\/\//i.test(rawUrl) ? rawUrl : `https://${rawUrl}`;
   await page.goto(url, { waitUntil: 'domcontentloaded' });
   await page.waitForTimeout(500);
-
-  if (page.url().includes('estudante.estacio.br') && await waitForLoggedInEstacio(12000)) {
-    console.log(`Aberto: ${url}`);
-    return;
-  }
-
-  const loginButton = await waitForAnyVisible([
-    'button.sc-dJGLCP.jPzwMQ',
-    'button:has-text("Entrar")',
-    '[role="button"]:has-text("Entrar")',
-  ], 1000);
-  if (!loginButton) {
-    console.log(`Aberto: ${url}`);
-    return;
-  }
-
-  await clickEstacioLoginButtonIfVisible();
-  await fillUserEstacioIfVisible();
-  console.log(`Aberto: ${url}`);
+  debugLog(`Aberto: ${url}`);
 }
 
-async function isLoggedInEstacio() {
-  if (!page.url().includes('estudante.estacio.br')) return false;
-  const pageText = await page.locator('body').innerText({ timeout: 1500 }).catch(() => '');
-  return /Cursando:|Meu curso|Secretaria digital|Minha Carreira|Minhas Disciplinas/i.test(pageText);
+async function openExercisesFromHome() {
+  await openUrl(HOME_URL);
+  await page.waitForLoadState('domcontentloaded').catch(() => {});
+  await page.waitForTimeout(1000);
+
+  await openHomeSidebar();
+  await page.waitForTimeout(500);
+
+  const openedCourseMenu = await clickMenuMeuCurso();
+  if (!openedCourseMenu) throw new Error('nao encontrei o menu Meu curso na sidebar');
+  await page.waitForTimeout(500);
+
+  const clicked = await clickMenuDisciplinas();
+  if (!clicked) throw new Error('nao encontrei "Disciplinas" na sidebar do inicio');
+
+  await page.waitForLoadState('domcontentloaded').catch(() => {});
+  await page.waitForTimeout(1000);
+  await openExerciseProgressCard();
 }
 
-async function waitForLoggedInEstacio(totalTimeoutMs) {
-  const deadline = Date.now() + totalTimeoutMs;
-  while (Date.now() < deadline) {
-    if (await isLoggedInEstacio()) return true;
+async function openExerciseProgressCard() {
+  await hideExercisesSidebar();
+  currentExerciseTitle = await readExercisePageTitle();
+
+  const clicked = await clickExerciseProgressCard();
+  if (!clicked) throw new Error('nao encontrei o card card-progresso-semestre-exercicio');
+
+  await page.waitForLoadState('domcontentloaded').catch(() => {});
+  await page.waitForTimeout(1000);
+  await runExercisePromptAutomaticallyAfterStart();
+}
+
+async function hideExercisesSidebar() {
+  const hideButton = await waitForAnyVisible([
+    'button.css-x43dmm',
+    '.css-x43dmm',
+    'button:has-text("Esconder")',
+    '[role="button"]:has-text("Esconder")',
+  ], 8000);
+
+  if (hideButton) {
+    await hideButton.click({ force: true });
     await page.waitForTimeout(500);
   }
-  return false;
 }
 
-async function clickEstacioLoginButtonIfVisible() {
-  const selectors = [
-    'button.sc-dJGLCP.jPzwMQ',
-    'button:has-text("Entrar")',
-    '[role="button"]:has-text("Entrar")',
+async function readExercisePageTitle() {
+  return page.evaluate(() => {
+    const clean = (value) => (value || '').replace(/\s+/g, ' ').trim();
+    const titleRoot = document.querySelector('[data-testid="titulo-pagina"]');
+    const title = clean(titleRoot?.querySelector('h2')?.innerText || titleRoot?.textContent);
+    if (title) return title.replace(/^Disciplina\s*/i, '').trim();
+
+    return clean(document.querySelector('.css-18iwutk')?.textContent || '');
+  }).catch(() => '');
+}
+
+async function clickExerciseProgressCard() {
+  {
+    const clicked = await clickVisibleBySelectors([
+      '[data-testid="progresso-semestre-container"] [data-testid="card-progresso-semestre-exercicio"]',
+      '[data-testid="progresso-semestre-container"] [data-element="card-progresso-semestre-exercicio"]',
+      '[data-testid="card-progresso-semestre-exercicio"]',
+      '[data-element="card-progresso-semestre-exercicio"]',
+      '#card-progresso-semestre-exercicio',
+    ], 12000);
+
+    if (clicked) return true;
+
+    const fallback = await page.evaluate(() => {
+      const normalize = (value) => String(value || '')
+        .normalize('NFD')
+        .replace(/[\u0300-\u036f]/g, '')
+        .replace(/\s+/g, ' ')
+        .trim()
+        .toLowerCase();
+      const isVisible = (element) => {
+        if (!element || !(element instanceof Element)) return false;
+        const style = window.getComputedStyle(element);
+        const rect = element.getBoundingClientRect();
+        return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+      };
+
+      const root = document.querySelector('[data-testid="progresso-semestre-container"]') || document.body;
+      const candidates = [...root.querySelectorAll('[data-testid], [data-element], button, [role="button"], a, div')];
+      const card = candidates.find((element) => {
+        const dataElement = element.getAttribute('data-element') || '';
+        const dataTestId = element.getAttribute('data-testid') || '';
+        const text = normalize(element.innerText || element.textContent);
+        return isVisible(element) && (
+          dataTestId === 'card-progresso-semestre-exercicio' ||
+          dataElement === 'card-progresso-semestre-exercicio' ||
+          text.includes('exercicio')
+        );
+      });
+
+      const clickable = card?.closest('button, [role="button"], a') || card;
+      if (!clickable) return false;
+      clickable.scrollIntoView({ block: 'center', inline: 'center' });
+      clickable.click();
+      return true;
+    }).catch(() => false);
+
+    return fallback;
+  }
+
+  const clicked = await clickVisibleBySelectors([
+    '.sc-hIPCAM.kBvaIc.content button[data-testid="button-redirect"]',
+    '.sc-hIPCAM.kBvaIc.content button[data-element^="button_fazer-exercicios"]',
+    '.sc-hIPCAM.kBvaIc.content button:has-text("Fazer Exercícios")',
+    '.sc-hIPCAM.kBvaIc.content button:has-text("Fazer Exercicios")',
+    '.content button[data-testid="button-redirect"]',
+    '.content button[data-element^="button_fazer-exercicios"]',
+    '.content button:has-text("Fazer Exercícios")',
+    '.content button:has-text("Fazer Exercicios")',
+    'button[data-testid="button-redirect"]',
+    'button[data-element^="button_fazer-exercicios"]',
+    'button:has-text("Fazer Exercícios")',
+    'button:has-text("Fazer Exercicios")',
+  ], 12000);
+
+  if (clicked) return true;
+
+  return page.evaluate(() => {
+    const normalize = (value) => String(value || '')
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .toLowerCase();
+    const isVisible = (element) => {
+      if (!element || !(element instanceof Element)) return false;
+      const style = window.getComputedStyle(element);
+      const rect = element.getBoundingClientRect();
+      return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+    };
+
+    const roots = [...document.querySelectorAll('.sc-hIPCAM.kBvaIc.content, .content')];
+    const candidates = (roots.length > 0 ? roots : [document.body])
+      .flatMap((root) => [...root.querySelectorAll('button, [role="button"], a')]);
+    const button = candidates.find((element) => {
+      const dataElement = element.getAttribute('data-element') || '';
+      const dataTestId = element.getAttribute('data-testid') || '';
+      const text = normalize(element.innerText || element.textContent);
+      return isVisible(element) && (
+        dataTestId === 'button-redirect' ||
+        dataElement.startsWith('button_fazer-exercicios') ||
+        text.includes('fazer exercicios')
+      );
+    });
+
+    if (!button) return false;
+    button.scrollIntoView({ block: 'center', inline: 'center' });
+    button.click();
+    return true;
+  }).catch(() => false);
+}
+
+async function openHomeSidebar() {
+  const menuSelectors = [
+    'button:has(svg.menu)',
+    'svg.menu',
+    '.menu',
+    'button.menu',
+    '[aria-label*="menu" i]',
+    '[aria-label*="Menu" i]',
   ];
 
-  for (const selector of selectors) {
-    const locator = page.locator(selector).first();
-    try {
-      await locator.waitFor({ state: 'visible', timeout: 2500 });
-      await locator.click();
-      console.log('Tela de login detectada: cliquei em Entrar.');
-      await page.waitForLoadState('domcontentloaded').catch(() => {});
-      await page.waitForTimeout(1000);
-      await fillUserEstacioIfVisible();
-      await page.waitForTimeout(2000);
-      await fillUserEstacioIfVisible();
-      return;
-    } catch {
-      // Tenta o proximo seletor.
-    }
+  const menu = await waitForAnyVisible(menuSelectors, 8000);
+  if (menu) {
+    await menu.click({ force: true }).catch(async () => {
+      const parentButton = menu.locator('xpath=ancestor-or-self::button[1]').first();
+      if (await parentButton.count().catch(() => 0)) await parentButton.click({ force: true });
+    });
+    return true;
   }
+
+  return page.evaluate(() => {
+    const svg = document.querySelector('svg.menu');
+    const clickable = svg?.closest('button, [role="button"], a') || svg;
+    if (!clickable) return false;
+    clickable.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+    return true;
+  }).catch(() => false);
+}
+
+async function clickMenuMeuCurso() {
+  const clicked = await clickVisibleBySelectors([
+    '[data-element="button_menu-meu-curso"]',
+    '[data-testid="button_menu-meu-curso"]',
+    '#button_menu-meu-curso',
+    '.button_menu-meu-curso',
+    'button[data-element="button_menu-meu-curso"]',
+    '[role="button"][data-element="button_menu-meu-curso"]',
+  ], 8000);
+
+  if (clicked) return true;
+  return clickSidebarItemByText('meu curso');
+}
+
+async function clickMenuDisciplinas() {
+  const clicked = await clickVisibleBySelectors([
+    '[data-element="button_menu-disciplinas"]',
+    '[data-testid="button_menu-disciplinas"]',
+    '#button_menu-disciplinas',
+    '.button_menu-disciplinas',
+    'button.button_menu-disciplinas',
+    'button[data-element="button_menu-disciplinas"]',
+    '[role="button"][data-element="button_menu-disciplinas"]',
+    'a:has-text("Disciplinas")',
+    'button:has-text("Disciplinas")',
+    '[role="button"]:has-text("Disciplinas")',
+  ], 8000);
+
+  if (clicked) return true;
+  return clickSidebarItemByText('disciplinas');
+}
+
+async function clickVisibleBySelectors(selectors, timeoutMs) {
+  const locator = await waitForAnyVisible(selectors, timeoutMs);
+  if (!locator) return false;
+  await locator.click({ force: true });
+  return true;
+}
+
+async function clickSidebarItemByText(targetText) {
+  const directSelectors = [
+    '[data-element="button_menu-disciplinas"]',
+    '[data-testid="button_menu-disciplinas"]',
+    '#button_menu-disciplinas',
+    '.button_menu-disciplinas',
+    'button.button_menu-disciplinas',
+    'button[data-element="button_menu-disciplinas"]',
+  ];
+
+  const direct = await waitForAnyVisible(directSelectors, 5000);
+  if (direct) {
+    await direct.click();
+    return true;
+  }
+
+  return page.evaluate((wantedText) => {
+    const normalize = (value) => String(value || '')
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .toLowerCase();
+    const isVisible = (element) => {
+      if (!element || !(element instanceof Element)) return false;
+      const style = window.getComputedStyle(element);
+      const rect = element.getBoundingClientRect();
+      return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+    };
+
+    const roots = [...document.querySelectorAll('aside, nav, [class*="sidebar"], [class*="menu"], [data-testid*="sidebar"], body')];
+    const candidates = roots.flatMap((root) => [...root.querySelectorAll('a, button, [role="button"], div, span, p')]);
+    const element = candidates
+      .filter(isVisible)
+      .find((candidate) => normalize(candidate.innerText || candidate.textContent).includes(wantedText));
+
+    const clickable = element?.closest('a, button, [role="button"]') || element;
+    if (!clickable) return false;
+
+    clickable.scrollIntoView({ block: 'center', inline: 'center' });
+    clickable.click();
+    return true;
+  }, normalizeText(targetText));
 }
 
 async function fillUserEstacioIfVisible() {
@@ -201,7 +469,7 @@ async function fillUserEstacioIfVisible() {
       await locator.waitFor({ state: 'visible', timeout: 4000 });
       await locator.fill(userEstacio);
       filled = true;
-      console.log('Tela de confirmacao de e-mail detectada: preenchi user_estacio.');
+      debugLog('Tela de confirmacao de e-mail detectada: preenchi user_estacio.');
       break;
     } catch {
       // Tenta o proximo seletor.
@@ -225,7 +493,7 @@ async function fillUserEstacioIfVisible() {
     try {
       await locator.waitFor({ state: 'visible', timeout: 3000 });
       await locator.click();
-      console.log('Cliquei no botao primario da confirmacao de e-mail.');
+      debugLog('Cliquei no botao primario da confirmacao de e-mail.');
       await page.waitForLoadState('domcontentloaded').catch(() => {});
       await page.waitForTimeout(1000);
       await fillPasswordEstacioIfVisible();
@@ -239,7 +507,7 @@ async function fillUserEstacioIfVisible() {
 async function readUserEstacio() {
   const userEnvFile = USER_ENV_FILES.find((filePath) => existsSync(filePath));
   if (!userEnvFile) {
-    console.log('Arquivo user.env nao encontrado em Prova nem em GitHub; nao preenchi user_estacio.');
+    debugLog('Arquivo user.env nao encontrado em Prova nem em GitHub; nao preenchi user_estacio.');
     return '';
   }
 
@@ -247,7 +515,7 @@ async function readUserEstacio() {
   const values = parseEnvText(envText);
   const userEstacio = values.user_estacio || values.USER_ESTACIO || values.email_estacio || values.EMAIL_ESTACIO;
   if (!userEstacio) {
-    console.log(`user.env encontrado em ${userEnvFile}, mas sem user_estacio.`);
+    debugLog(`user.env encontrado em ${userEnvFile}, mas sem user_estacio.`);
     return '';
   }
 
@@ -270,7 +538,7 @@ async function fillPasswordEstacioIfVisible() {
   if (!passwordInput) return;
 
   await passwordInput.fill(passwordEstacio);
-  console.log('Campo de senha detectado: preenchi password_estacio automaticamente.');
+  debugLog('Campo de senha detectado: preenchi password_estacio automaticamente.');
 
   const buttonSelectors = [
     '.win-button.button_primary.high-contrast-overrides.button.ext-button.primary.ext-primary',
@@ -286,7 +554,7 @@ async function fillPasswordEstacioIfVisible() {
     try {
       await locator.waitFor({ state: 'visible', timeout: 3000 });
       await locator.click();
-      console.log('Cliquei no botao primario da senha.');
+      debugLog('Cliquei no botao primario da senha.');
       await page.waitForLoadState('domcontentloaded').catch(() => {});
       await page.waitForTimeout(1500);
       return;
@@ -328,7 +596,7 @@ async function clickLoggedInMenuIfVisible() {
 
   try {
     await menu.click();
-    console.log('Usuario logado detectado: cliquei no menu.');
+    debugLog('Usuario logado detectado: cliquei no menu.');
     await page.waitForTimeout(500);
   } catch {
     // Se o clique falhar, apenas segue com a pagina aberta.
@@ -338,7 +606,7 @@ async function clickLoggedInMenuIfVisible() {
 async function readPasswordEstacio() {
   const userEnvFile = USER_ENV_FILES.find((filePath) => existsSync(filePath));
   if (!userEnvFile) {
-    console.log('Arquivo user.env nao encontrado em Prova nem em GitHub; nao preenchi password_estacio.');
+    debugLog('Arquivo user.env nao encontrado em Prova nem em GitHub; nao preenchi password_estacio.');
     return '';
   }
 
@@ -346,7 +614,7 @@ async function readPasswordEstacio() {
   const values = parseEnvText(envText);
   const passwordEstacio = values.password_estacio || values.PASSWORD_ESTACIO;
   if (!passwordEstacio) {
-    console.log(`user.env encontrado em ${userEnvFile}, mas sem password_estacio.`);
+    debugLog(`user.env encontrado em ${userEnvFile}, mas sem password_estacio.`);
     return '';
   }
 
@@ -374,13 +642,13 @@ async function readVisibleExam() {
   printReadSummary(lastRead);
 
   if (lastRead.questions.length === 0) {
-    console.log('Nao encontrei questoes visiveis. Role a pagina ou confira se a prova esta aberta.');
+    debugLog('Nao encontrei questoes visiveis. Role a pagina ou confira se a prova esta aberta.');
     return;
   }
 
   for (const question of lastRead.questions) {
-    console.log(`\nQuestao ${question.number ?? '?'}: ${question.statement}`);
-    for (const option of question.options) console.log(`  ${option.letter}) ${option.text}`);
+    debugLog(`\nQuestao ${question.number ?? '?'}: ${question.statement}`);
+    for (const option of question.options) debugLog(`  ${option.letter}) ${option.text}`);
   }
 }
 
@@ -407,19 +675,18 @@ async function oldCollectEvaluations() {
   await page.screenshot({ path: EVALUATIONS_SCREENSHOT, fullPage: true });
   await writeFile(EVALUATIONS_FILE, `${JSON.stringify(data, null, 2)}\n`, 'utf8');
 
-  console.log(`Provas pendentes detectadas: ${data.count}`);
+  debugLog(`Provas pendentes detectadas: ${data.count}`);
   for (const [index, title] of data.titles.entries()) {
-    console.log(`${index + 1}. ${title}`);
+    debugLog(`${index + 1}. ${title}`);
   }
-  console.log(`Print salvo em ${EVALUATIONS_SCREENSHOT}`);
-  console.log(`Resultado salvo em ${EVALUATIONS_FILE}`);
+  debugLog(`Print salvo em ${EVALUATIONS_SCREENSHOT}`);
+  debugLog(`Resultado salvo em ${EVALUATIONS_FILE}`);
 }
 
 async function oldCollectEvaluationsIfLoggedIn() {
   if (!page.url().includes('estudante.estacio.br/disciplinas')) return;
-  if (!(await isLoggedInEstacio())) return;
 
-  console.log('Usuario logado detectado em disciplinas. Vou abrir avaliacoes e listar provas pendentes.');
+  debugLog('Pagina de disciplinas aberta. Vou abrir avaliacoes e listar provas pendentes.');
   await collectEvaluations();
 }
 
@@ -461,62 +728,66 @@ function dedupeQuestions(questions) {
 async function saveLastRead() {
   if (!lastRead) throw new Error('nada para salvar ainda. Use "ler" primeiro.');
   await writeFile(OUTPUT_FILE, `${JSON.stringify(lastRead, null, 2)}\n`, 'utf8');
-  console.log(`Leitura salva em ${OUTPUT_FILE}`);
+  debugLog(`Leitura salva em ${OUTPUT_FILE}`);
 }
 
-async function savePromptForChat() {
+async function savePromptForChat(options = {}) {
+  const shouldFinalize = options.finalize ?? startMode === 'avaliacao';
   lastRead = await collectExam();
   printReadSummary(lastRead);
 
-  const prompt = [
-    'Resolva esta prova em portugues do Brasil.',
-    'Escolha exatamente uma alternativa por questao.',
-    'Comece sua resposta com uma linha no formato: RESPOSTAS: A B C D E A B C D E',
-    'Use somente letras A, B, C, D ou E nessa linha de respostas.',
-    'Depois, se quiser, inclua uma justificativa curta por questao.',
-    '',
-    buildAnswerPrompt(lastRead),
-  ].join('\n');
+  const prompt = buildAnswerPrompt(lastRead);
 
   await writeFile(PROMPT_FILE, prompt, 'utf8');
-  console.log(`Prompt salvo/substituido em ${PROMPT_FILE}`);
+  debugLog(`Prompt salvo/substituido em ${PROMPT_FILE}`);
   await copyTextToClipboard(prompt);
-  console.log('Prompt copiado para a area de transferencia.');
+  debugLog('Prompt copiado para a area de transferencia.');
 
-  const chatText = await openChatGptInChrome();
+  const chatText = await openChatGptInChrome(prompt);
   if (chatText) {
     await writeFile(CHATGPT_PAGE_TEXT_FILE, chatText, 'utf8');
     const parsed = extractAnswersFromChatText(chatText);
     if (parsed.length > 0) {
       await writeFile(ANSWERS_TEXT_FILE, `${formatAnswers(parsed)}\n`, 'utf8');
-      console.log(`Respostas detectadas e salvas em ${ANSWERS_TEXT_FILE}`);
-      await applyParsedAnswers(parsed);
+      debugLog(`Respostas detectadas e salvas em ${ANSWERS_TEXT_FILE}`);
+      await applyParsedAnswers(parsed, { finalize: shouldFinalize });
     } else {
-      console.log(`Texto salvo em ${CHATGPT_PAGE_TEXT_FILE}, mas nao encontrei sequencia de respostas.`);
+      debugLog(`Texto salvo em ${CHATGPT_PAGE_TEXT_FILE}, mas nao encontrei sequencia de respostas.`);
     }
   }
 
-  console.log('Revise a tela antes de finalizar a prova manualmente.');
+  debugLog('Revise a tela antes de finalizar a prova manualmente.');
 }
 
-async function openChatGptInChrome() {
+async function openChatGptInChrome(prompt) {
   if (!existsSync(CHROME_EXE)) {
-    console.log(`Nao encontrei Chrome em ${CHROME_EXE}. O prompt ja esta copiado.`);
+    debugLog(`Nao encontrei Chrome em ${CHROME_EXE}. O prompt ja esta copiado.`);
     return '';
   }
 
-  const child = spawn(CHROME_EXE, ['https://chatgpt.com/'], { detached: true, stdio: 'ignore' });
-  child.unref();
-  console.log('ChatGPT aberto no Chrome normal. Vou tentar colar, enviar e copiar a resposta.');
-  return pasteSendAndCopyChat();
+  const hasChrome = process.platform === 'win32'
+    ? (await runPowerShell("if (Get-Process chrome -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowHandle -ne 0 }) { 'yes' }").catch(() => '')).trim() === 'yes'
+    : false;
+
+  if (!hasChrome) {
+    const child = spawn(CHROME_EXE, [CHATGPT_PROVAS_URL], { detached: true, stdio: 'ignore' });
+    child.unref();
+    debugLog('Chrome aberto no chat Provas.');
+  } else {
+    debugLog('Chrome ja esta aberto. Vou reutilizar a aba atual e navegar para o chat Provas se precisar.');
+  }
+
+  debugLog('Vou tentar colar, enviar e copiar a resposta.');
+  return pasteSendAndCopyChat(prompt);
 }
 
-async function pasteSendAndCopyChat() {
+async function pasteSendAndCopyChat(prompt) {
   if (process.platform !== 'win32') {
-    console.log('Cole manualmente com Ctrl+V.');
+    debugLog('Cole manualmente com Ctrl+V.');
     return '';
   }
 
+  const promptFileForPowerShell = PROMPT_FILE.replace(/'/g, "''");
   const sendScript = `
     Start-Sleep -Milliseconds 3500
     $shell = New-Object -ComObject WScript.Shell
@@ -534,16 +805,28 @@ public class WindowFocus {
   [DllImport("user32.dll")]
   public static extern bool ShowWindowAsync(IntPtr hWnd, int nCmdShow);
   [DllImport("user32.dll")]
+  public static extern bool IsIconic(IntPtr hWnd);
+  [DllImport("user32.dll")]
   public static extern IntPtr GetForegroundWindow();
   [DllImport("user32.dll")]
   public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
 }
 "@
-    Get-Process firefox -ErrorAction SilentlyContinue |
-      Where-Object { $_.MainWindowHandle -ne 0 } |
-      ForEach-Object { [WindowFocus]::ShowWindowAsync($_.MainWindowHandle, 6) | Out-Null }
-    Start-Sleep -Milliseconds 300
-    [WindowFocus]::ShowWindowAsync($chrome.MainWindowHandle, 9) | Out-Null
+    Add-Type -AssemblyName System.Windows.Forms
+    Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+public class MouseClicker {
+  [DllImport("user32.dll")]
+  public static extern bool SetCursorPos(int X, int Y);
+  [DllImport("user32.dll")]
+  public static extern void mouse_event(int dwFlags, int dx, int dy, int cButtons, int dwExtraInfo);
+}
+"@
+    if ([WindowFocus]::IsIconic($chrome.MainWindowHandle)) {
+      [WindowFocus]::ShowWindowAsync($chrome.MainWindowHandle, 9) | Out-Null
+      Start-Sleep -Milliseconds 300
+    }
     [WindowFocus]::SetForegroundWindow($chrome.MainWindowHandle) | Out-Null
     Start-Sleep -Milliseconds 500
     $activated = $shell.AppActivate([int]$chrome.Id)
@@ -553,26 +836,83 @@ public class WindowFocus {
     $foregroundPid = 0
     [WindowFocus]::GetWindowThreadProcessId($foreground, [ref]$foregroundPid) | Out-Null
     if ($foregroundPid -ne $chrome.Id) {
-      $shell.SendKeys('%{TAB}')
-      Start-Sleep -Milliseconds 700
+      [WindowFocus]::SetForegroundWindow($chrome.MainWindowHandle) | Out-Null
+      Start-Sleep -Milliseconds 500
     }
-    $shell.SendKeys('^t')
-    Start-Sleep -Milliseconds 500
-    $shell.SendKeys('https://chatgpt.com/')
+    $shell.SendKeys('^l')
+    Start-Sleep -Milliseconds 200
+    $shell.SendKeys('${CHATGPT_PROVAS_URL}')
     Start-Sleep -Milliseconds 300
     $shell.SendKeys('{ENTER}')
     Start-Sleep -Milliseconds 4500
-    Start-Sleep -Milliseconds 500
+    $promptText = Get-Content -LiteralPath '${promptFileForPowerShell}' -Raw -Encoding UTF8
+    Set-Clipboard -Value $promptText
+    Start-Sleep -Milliseconds 300
+    $bounds = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+    $x = [int]($bounds.Width * 0.58)
+    $y = [int]($bounds.Height * 0.88)
+    [MouseClicker]::SetCursorPos($x, $y) | Out-Null
+    Start-Sleep -Milliseconds 100
+    [MouseClicker]::mouse_event(2, 0, 0, 0, 0)
+    Start-Sleep -Milliseconds 50
+    [MouseClicker]::mouse_event(4, 0, 0, 0, 0)
+    Start-Sleep -Milliseconds 300
     $shell.SendKeys('^v')
-    Start-Sleep -Milliseconds 10000
-    $shell.SendKeys('{ENTER}')
+    Start-Sleep -Milliseconds 500
+
+    Add-Type -AssemblyName UIAutomationClient
+    Add-Type -AssemblyName UIAutomationTypes
+
+    $root = [System.Windows.Automation.AutomationElement]::FromHandle($chrome.MainWindowHandle)
+    $buttonCondition = New-Object System.Windows.Automation.PropertyCondition(
+      [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+      [System.Windows.Automation.ControlType]::Button
+    )
+
+    $deadline = (Get-Date).AddSeconds(60)
+    $sent = $false
+    while ((Get-Date) -lt $deadline -and -not $sent) {
+      $buttons = $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $buttonCondition)
+      foreach ($button in $buttons) {
+        $name = $button.Current.Name
+        if (
+          $button.Current.IsEnabled -and
+          $button.Current.BoundingRectangle.Width -gt 0 -and
+          $button.Current.BoundingRectangle.Height -gt 0 -and
+          ($name -match 'Enviar|Send|Submit')
+        ) {
+          try {
+            $invokePattern = $button.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern)
+            $invokePattern.Invoke()
+            $sent = $true
+            break
+          } catch {
+            $rect = $button.Current.BoundingRectangle
+            $clickX = [int]($rect.Left + ($rect.Width / 2))
+            $clickY = [int]($rect.Top + ($rect.Height / 2))
+            [MouseClicker]::SetCursorPos($clickX, $clickY) | Out-Null
+            Start-Sleep -Milliseconds 100
+            [MouseClicker]::mouse_event(2, 0, 0, 0, 0)
+            Start-Sleep -Milliseconds 50
+            [MouseClicker]::mouse_event(4, 0, 0, 0, 0)
+            $sent = $true
+            break
+          }
+        }
+      }
+      if (-not $sent) { Start-Sleep -Milliseconds 500 }
+    }
+
+    if (-not $sent) {
+      $shell.SendKeys('{ENTER}')
+    }
   `;
 
   try {
-    await runPowerShell(sendScript);
-    console.log('Colei, aguardei 10s e enviei no ChatGPT. Vou aguardar a linha RESPOSTAS.');
+    await runPowerShell(sendScript, 90000);
+    debugLog('Colei no ChatGPT e enviei quando o botao ficou disponivel.');
   } catch {
-    console.log('Nao consegui focar o Chrome. O prompt ja esta copiado; cole manualmente.');
+    debugLog('Nao consegui focar o Chrome. O prompt ja esta copiado; cole manualmente.');
     return '';
   }
 
@@ -581,12 +921,12 @@ public class WindowFocus {
     await page.waitForTimeout(2000);
     lastCopiedText = await copyChromePageText().catch(() => '');
     if (extractAnswersFromChatText(lastCopiedText).length > 0) {
-      console.log(`Resposta do ChatGPT encontrada na tentativa ${attempt}.`);
+      debugLog(`Resposta do ChatGPT encontrada na tentativa ${attempt}.`);
       return lastCopiedText;
     }
   }
 
-  console.log('Copiei o texto da pagina, mas ainda nao encontrei uma linha RESPOSTAS valida.');
+  debugLog('Copiei o texto da pagina, mas ainda nao encontrei uma linha RESPOSTAS valida.');
   return lastCopiedText;
 }
 
@@ -607,16 +947,17 @@ public class WindowFocus {
   [DllImport("user32.dll")]
   public static extern bool ShowWindowAsync(IntPtr hWnd, int nCmdShow);
   [DllImport("user32.dll")]
+  public static extern bool IsIconic(IntPtr hWnd);
+  [DllImport("user32.dll")]
   public static extern IntPtr GetForegroundWindow();
   [DllImport("user32.dll")]
   public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
 }
 "@
-    Get-Process firefox -ErrorAction SilentlyContinue |
-      Where-Object { $_.MainWindowHandle -ne 0 } |
-      ForEach-Object { [WindowFocus]::ShowWindowAsync($_.MainWindowHandle, 6) | Out-Null }
-    Start-Sleep -Milliseconds 300
-    [WindowFocus]::ShowWindowAsync($chrome.MainWindowHandle, 9) | Out-Null
+    if ([WindowFocus]::IsIconic($chrome.MainWindowHandle)) {
+      [WindowFocus]::ShowWindowAsync($chrome.MainWindowHandle, 9) | Out-Null
+      Start-Sleep -Milliseconds 300
+    }
     [WindowFocus]::SetForegroundWindow($chrome.MainWindowHandle) | Out-Null
     Start-Sleep -Milliseconds 500
     $activated = $shell.AppActivate([int]$chrome.Id)
@@ -626,8 +967,8 @@ public class WindowFocus {
     $foregroundPid = 0
     [WindowFocus]::GetWindowThreadProcessId($foreground, [ref]$foregroundPid) | Out-Null
     if ($foregroundPid -ne $chrome.Id) {
-      $shell.SendKeys('%{TAB}')
-      Start-Sleep -Milliseconds 700
+      [WindowFocus]::SetForegroundWindow($chrome.MainWindowHandle) | Out-Null
+      Start-Sleep -Milliseconds 500
     }
     Start-Sleep -Milliseconds 300
     $shell.SendKeys('{ESC}')
@@ -661,13 +1002,17 @@ public class MouseClicker {
   return runPowerShell(script);
 }
 
-async function runPowerShell(script) {
+async function runPowerShell(script, timeoutMs = 30000) {
   return new Promise((resolve, reject) => {
     const child = spawn('powershell.exe', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', script], {
       stdio: ['ignore', 'pipe', 'pipe'],
     });
     let stdout = '';
     let stderr = '';
+    const timer = setTimeout(() => {
+      child.kill();
+      reject(new Error(`PowerShell excedeu ${timeoutMs}ms`));
+    }, timeoutMs);
 
     child.stdout?.on('data', (chunk) => {
       stdout += chunk.toString();
@@ -675,8 +1020,12 @@ async function runPowerShell(script) {
     child.stderr?.on('data', (chunk) => {
       stderr += chunk.toString();
     });
-    child.on('error', reject);
+    child.on('error', (error) => {
+      clearTimeout(timer);
+      reject(error);
+    });
     child.on('close', (code) => {
+      clearTimeout(timer);
       if (code === 0) resolve(stdout);
       else reject(new Error(stderr || `PowerShell saiu com codigo ${code}`));
     });
@@ -688,32 +1037,60 @@ async function applyAnswerList(args) {
   lastRead = await collectExam();
   const questions = dedupeQuestions(lastRead.questions).slice(0, 10);
   const answers = parseAnswerArgs(rawAnswers, questions);
-  await applyParsedAnswers(answers);
+  await applyParsedAnswers(answers, { finalize: startMode === 'avaliacao' });
 }
 
-async function applyParsedAnswers(answers) {
+async function applyParsedAnswers(answers, options = {}) {
+  const shouldFinalize = options.finalize ?? true;
   if (!answers.length) throw new Error('nao encontrei respostas para marcar');
 
   await focusExamBrowserWindow();
   await page.bringToFront().catch(() => {});
   lastRead = await collectExam();
-  console.log(`Vou marcar automaticamente: ${answers.map((answer) => answer.letter).join(' ')}`);
+  debugLog(`Vou marcar automaticamente: ${answers.map((answer) => answer.letter).join(' ')}`);
+
+  let markedCount = 0;
+  if (!shouldFinalize) {
+    for (const answer of answers) {
+      const result = await clickAnswerWithLocators(answer.questionNumber, answer.letter);
+
+      if (result.ok) {
+        markedCount += 1;
+        debugLog(`Marcada: questao ${answer.questionNumber}, alternativa ${answer.letter}.`);
+      } else {
+        debugLog(`Nao marcou questao ${answer.questionNumber}: ${result.reason}`);
+      }
+    }
+
+    if (answers.length < 10) {
+      debugLog('Nao finalizei o exercicio porque detectei menos de 10 respostas.');
+      return;
+    }
+
+    debugLog(`Exercicio respondido automaticamente (${markedCount}/${answers.length}).`);
+    await finishExerciseAndRestart();
+    return;
+  }
 
   for (const answer of answers) {
     const result = await markAnswerAndConfirm(answer.questionNumber, answer.letter);
 
-    if (result.ok) console.log(`Marcada: questao ${answer.questionNumber}, alternativa ${answer.letter}.`);
-    else console.log(`Nao marcou questao ${answer.questionNumber}: ${result.reason}`);
+    if (result.ok) {
+      markedCount += 1;
+      debugLog(`Marcada: questao ${answer.questionNumber}, alternativa ${answer.letter}.`);
+    } else {
+      debugLog(`Nao marcou questao ${answer.questionNumber}: ${result.reason}`);
+    }
   }
 
   if (answers.length < 10) {
-    console.log('Nao finalizei porque detectei menos de 10 respostas.');
+    debugLog('Nao finalizei porque detectei menos de 10 respostas.');
     return;
   }
 
   const answeredCount = await getAnsweredCount();
   if (answeredCount < 10) {
-    console.log(`Nao finalizei porque o painel ainda mostra Respondidas (${answeredCount}).`);
+    debugLog(`Nao finalizei porque o painel ainda mostra Respondidas (${answeredCount}).`);
     return;
   }
 
@@ -721,14 +1098,12 @@ async function applyParsedAnswers(answers) {
 }
 
 async function markAnswerAndConfirm(questionNumber, letter) {
-  const before = await getAnsweredCount();
   for (let attempt = 1; attempt <= 3; attempt += 1) {
     const result = await clickAnswerWithLocators(questionNumber, letter);
     await page.waitForTimeout(700);
-    const after = await getAnsweredCount();
-    const checked = await isQuestionAnswered(questionNumber);
+    const checked = await isQuestionAnsweredWithLetter(questionNumber, letter);
 
-    if (result.ok && (checked || after > before || after >= questionNumber)) {
+    if (result.ok && checked) {
       return { ok: true };
     }
   }
@@ -788,6 +1163,133 @@ async function isQuestionAnswered(questionNumber) {
   }, questionNumber).catch(() => false);
 }
 
+async function isQuestionAnsweredWithLetter(questionNumber, letter) {
+  return page.evaluate(`(() => {
+    ${browserHelpersSource()}
+    const roots = findQuestionRoots();
+    const root =
+      document.querySelector('[data-testid="question-${questionNumber}"]') ||
+      roots.find((candidate, index) => {
+        const match = textOf(candidate).match(/(?:^|\\n)\\s*(\\d{1,2})\\s*(?:\\n|$)/);
+        const parsed = match ? Number(match[1]) : null;
+        return parsed === ${questionNumber} || (parsed === null && index + 1 === ${questionNumber});
+      });
+    if (!root) return false;
+
+    const optionRoot = findOptionRoot(root, ${JSON.stringify(letter)});
+    if (!optionRoot) return false;
+
+    const selectedSelector = [
+      'input[type="radio"]:checked',
+      'input[type="checkbox"]:checked',
+      '[aria-checked="true"]',
+      '[aria-selected="true"]',
+      '[data-state="checked"]',
+      '[data-checked="true"]',
+    ].join(',');
+    if (optionRoot.matches?.(selectedSelector) || optionRoot.querySelector(selectedSelector)) return true;
+
+    const checkedInput = root.querySelector('input[type="radio"]:checked, input[type="checkbox"]:checked');
+    if (checkedInput && optionRoot.contains(checkedInput)) return true;
+
+    return false;
+  })()`).catch(() => false);
+}
+
+async function finishExerciseAndRestart() {
+  await focusExamBrowserWindow();
+  await page.bringToFront().catch(() => {});
+  await page.waitForTimeout(800);
+
+  const finishButton = await waitForAnyVisible([
+    'button[data-element="button_finalizar-prova"]',
+    'button[data-element="button_finalizar-prova"]:has-text("Finalizar exercícios")',
+    'button[data-element="button_finalizar-prova"]:has-text("Finalizar exercicios")',
+    'button[aria-label="Finalizar exercícios"]',
+    'button[aria-label="Finalizar exercicios"]',
+    'button.css-18p9o19:has-text("Finalizar exercícios")',
+    'button.css-18p9o19:has-text("Finalizar exercicios")',
+  ], 15000);
+
+  if (finishButton) {
+    await finishButton.click({ force: true });
+  } else {
+    const clicked = await clickButtonByNormalizedText('finalizar exercicios');
+    if (!clicked) {
+      debugLog('Exercicio respondido, mas nao encontrei o botao Finalizar exercicios.');
+      return;
+    }
+  }
+
+  await page.waitForTimeout(1000);
+
+  const submitButton = await waitForAnyVisible([
+    'button[data-testid="submit-button"]',
+    'button[data-testid="submit-button"]:has-text("Finalizar exercícios")',
+    'button[data-testid="submit-button"]:has-text("Finalizar exercicios")',
+    'button.css-18p9o19:has-text("Finalizar exercícios")',
+    'button.css-18p9o19:has-text("Finalizar exercicios")',
+  ], 15000);
+
+  if (submitButton) {
+    await submitButton.click({ force: true });
+  } else {
+    const clicked = await clickButtonByNormalizedText('finalizar exercicios');
+    if (!clicked) {
+      debugLog('Cliquei em Finalizar exercicios, mas nao encontrei o botao do popup.');
+      return;
+    }
+  }
+
+  await page.waitForLoadState('domcontentloaded').catch(() => {});
+  await page.waitForTimeout(1500);
+
+  const exitButton = await waitForAnyVisible([
+    'button[data-testid="exit-button-desktop"]',
+    'button[data-element="button_sair"]',
+    'button[data-info="button_sair"]',
+    'button[aria-label="Sair"]',
+  ], 15000);
+
+  if (exitButton) {
+    await exitButton.click({ force: true });
+    await page.waitForLoadState('domcontentloaded').catch(() => {});
+    await page.waitForTimeout(1500);
+  }
+
+  await openUrl(DEFAULT_SITE_URL);
+  await openExercisesFromHome();
+}
+
+async function clickButtonByNormalizedText(targetText) {
+  return page.evaluate((wantedText) => {
+    const normalize = (value) => String(value || '')
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .toLowerCase();
+    const isVisible = (element) => {
+      if (!element || !(element instanceof Element)) return false;
+      const style = window.getComputedStyle(element);
+      const rect = element.getBoundingClientRect();
+      return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+    };
+    const isEnabled = (element) => (
+      !element.disabled &&
+      element.getAttribute('aria-disabled') !== 'true'
+    );
+    const button = [...document.querySelectorAll('button, [role="button"], a')]
+      .filter(isVisible)
+      .filter(isEnabled)
+      .find((element) => normalize(element.innerText || element.textContent || element.getAttribute('aria-label')).includes(wantedText));
+    if (!button) return false;
+    button.scrollIntoView({ block: 'center', inline: 'center' });
+    button.click();
+    return true;
+  }, normalizeText(targetText)).catch(() => false);
+}
+
 async function finishExamWithToken() {
   await focusExamBrowserWindow();
   await page.bringToFront().catch(() => {});
@@ -801,7 +1303,7 @@ async function finishExamWithToken() {
   ], 15000);
 
   if (!finishButton) {
-    console.log('Respostas marcadas, mas nao encontrei o botao Finalizar prova.');
+    debugLog('Respostas marcadas, mas nao encontrei o botao Finalizar prova.');
     return;
   }
 
@@ -815,7 +1317,7 @@ async function finishExamWithToken() {
   }).catch(() => '');
 
   if (!token) {
-    console.log('Cliquei em Finalizar prova, mas nao encontrei o token no modal.');
+    debugLog('Cliquei em Finalizar prova, mas nao encontrei o token no modal.');
     return;
   }
 
@@ -828,7 +1330,7 @@ async function finishExamWithToken() {
   ], 15000);
 
   if (!tokenInput) {
-    console.log(`Token encontrado (${token}), mas nao encontrei o campo para preencher.`);
+    debugLog(`Token encontrado (${token}), mas nao encontrei o campo para preencher.`);
     return;
   }
 
@@ -872,13 +1374,72 @@ async function finishExamWithToken() {
   });
 
   if (!clicked) {
-    console.log(`Preenchi o token ${token}, mas nao encontrei o botao final habilitado.`);
+    debugLog(`Preenchi o token ${token}, mas nao encontrei o botao final habilitado.`);
     return;
   }
 
   await page.waitForLoadState('domcontentloaded').catch(() => {});
   await page.waitForTimeout(1500);
-  console.log(`Prova finalizada com token ${token}.`);
+  debugLog(`Prova finalizada com token ${token}.`);
+  await returnToEvaluationsAndContinue();
+}
+
+async function returnToEvaluationsAndContinue() {
+  await page.waitForTimeout(1200);
+
+  const evaluationsButton = await waitForAnyVisible([
+    'button:has(.css-18eckzp):has-text("Ir para")',
+    'button:has-text("Ir para")',
+    '[role="button"]:has-text("Ir para")',
+    '.css-18eckzp',
+  ], 5000);
+
+  if (evaluationsButton) {
+    const parentButton = evaluationsButton.locator('xpath=ancestor-or-self::button[1]').first();
+    if (await parentButton.count().catch(() => 0)) {
+      await parentButton.click({ force: true }).catch(() => {});
+    } else {
+      await evaluationsButton.click({ force: true }).catch(() => {});
+    }
+  } else {
+    const clicked = await page.evaluate(() => {
+      const clean = (value) => (value || '').replace(/\s+/g, ' ').trim();
+      const candidates = [...document.querySelectorAll('button, [role="button"], a')];
+      const button = candidates.find((element) => /Ir para avalia|Ir para/i.test(clean(element.innerText || element.textContent)));
+      if (!button) return false;
+      button.scrollIntoView({ block: 'center', inline: 'center' });
+      button.click();
+      return true;
+    });
+
+    if (!clicked) {
+      debugLog('Prova finalizada, mas nao encontrei o botao Ir para avaliacoes. Vou abrir a lista diretamente.');
+      await openUrl(EVALUATIONS_URL);
+    }
+  }
+
+  await page.waitForLoadState('domcontentloaded').catch(() => {});
+  await page.waitForTimeout(1200);
+
+  if (/saladeavaliacoes\.com\.br\/avaliacoes\/[^/?]+\/?/i.test(page.url())) {
+    debugLog('Voltei para a pagina da mesma avaliacao. Vou revisar Simulados e Prova AV antes de avancar.');
+    await clickSimuladosIfAvailable();
+    return;
+  }
+
+  if (page.url().includes('estudante.estacio.br/avaliacoes')) {
+    debugLog('Voltei para a lista. Vou reabrir a mesma avaliacao para verificar pendencias.');
+    await accessEvaluationByIndex(currentEvaluationIndex).catch((error) => {
+      debugLog(`Nao consegui reabrir a avaliacao atual: ${error.message}`);
+    });
+    return;
+  }
+
+  debugLog('Nao reconheci a pagina apos finalizar. Vou abrir a lista de avaliacoes e reabrir a mesma avaliacao.');
+  await openUrl(EVALUATIONS_URL);
+  await accessEvaluationByIndex(currentEvaluationIndex).catch((error) => {
+    debugLog(`Nao consegui reabrir a avaliacao atual: ${error.message}`);
+  });
 }
 
 async function focusExamBrowserWindow() {
@@ -992,8 +1553,8 @@ function parseAnswerArgs(rawAnswers, questions) {
 }
 
 function printReadSummary(read) {
-  console.log(`\nTitulo: ${read.title || '(nao detectado)'}`);
-  console.log(`Questoes detectadas: ${read.questions.length}`);
+  debugLog(`\nTitulo: ${read.title || '(nao detectado)'}`);
+  debugLog(`Questoes detectadas: ${read.questions.length}`);
 }
 
 function buildAnswerPrompt(read) {
@@ -1002,7 +1563,7 @@ function buildAnswerPrompt(read) {
     statement: question.statement,
     options: question.options,
   }));
-  return JSON.stringify(
+  const questionPayload = JSON.stringify(
     {
       title: read.title,
       totalQuestionsDetected: read.questions.length,
@@ -1015,6 +1576,10 @@ function buildAnswerPrompt(read) {
     null,
     2,
   );
+  const title = read.title || currentExerciseTitle || '(titulo nao detectado)';
+  return ANSWER_PROMPT_TEMPLATE
+    .replaceAll('{ titulo prova }', title)
+    .replace('{ questoes }', questionPayload);
 }
 
 async function markOption(args) {
@@ -1028,14 +1593,14 @@ async function markOption(args) {
     return clickOptionByQuestionAndLetter(${number}, ${JSON.stringify(letter)});
   })()`);
   if (!result.ok) throw new Error(result.reason);
-  console.log(`Clique executado: questao ${number}, alternativa ${letter}.`);
+  debugLog(`Clique executado: questao ${number}, alternativa ${letter}.`);
 }
 
 async function scrollPage(direction = 'baixo') {
   const amount = ['cima', 'up'].includes((direction ?? '').toLowerCase()) ? -650 : 650;
   await page.mouse.wheel(0, amount);
   await page.waitForTimeout(250);
-  console.log(amount > 0 ? 'Rolei para baixo.' : 'Rolei para cima.');
+  debugLog(amount > 0 ? 'Rolei para baixo.' : 'Rolei para cima.');
 }
 
 async function goToQuestion(rawNumber) {
@@ -1049,7 +1614,7 @@ async function goToQuestion(rawNumber) {
     button.click();
     return true;
   }, number);
-  console.log(clicked ? `Tentei abrir a questao ${number}.` : `Nao encontrei botao de navegacao para a questao ${number}.`);
+  debugLog(clicked ? `Tentei abrir a questao ${number}.` : `Nao encontrei botao de navegacao para a questao ${number}.`);
 }
 
 function browserHelpersSource() {
@@ -1074,7 +1639,7 @@ function scrapeVisibleExam() {
   return { title, capturedAt: new Date().toISOString(), url: location.href, questions };
 
   function detectTitle() {
-    const explicitTitle = [...document.querySelectorAll('.css-1qsp6bi')]
+    const explicitTitle = [...document.querySelectorAll('.css-1yfjwh2, .css-1qsp6bi')]
       .map(textOf)
       .find((text) => text && /[A-Za-z\u00c0-\u00ff]/.test(text) && text.length <= 120);
     if (explicitTitle) return explicitTitle;
@@ -1127,6 +1692,9 @@ function scrapeVisibleExam() {
 }
 
 function findQuestionRoots() {
+  const byTestId = [...document.querySelectorAll('[data-testid^="question-"]')].filter(visible);
+  if (byTestId.length > 0) return byTestId;
+
   const reviewButtons = [...document.querySelectorAll('button, [role="button"]')].filter((element) => /marcar para revis(?:a|\u00e3)o/i.test(textOf(element)));
   const roots = [];
   for (const button of reviewButtons) {
@@ -1140,7 +1708,23 @@ function findQuestionRoots() {
     }
     if (best && !roots.includes(best)) roots.push(best);
   }
-  return roots.filter(visible);
+  if (roots.length > 0) return roots.filter(visible);
+
+  const genericRoots = [...document.querySelectorAll('section, article, li, [class*="question"], [class*="questao"], [class*="pergunta"], div')]
+    .filter(visible)
+    .map((element) => ({ element, text: textOf(element) }))
+    .filter(({ text }) => /quest(?:a|\u00e3)o\s*\d{1,2}|^\s*\d{1,2}\s+/i.test(text))
+    .filter(({ text }) => /\bA\b/.test(text) && /\bB\b/.test(text) && /\bC\b/.test(text))
+    .filter(({ text }) => text.length > 120 && text.length < 4000)
+    .sort((a, b) => a.text.length - b.text.length)
+    .map(({ element }) => element);
+
+  const uniqueRoots = [];
+  for (const root of genericRoots) {
+    if (uniqueRoots.some((existing) => existing.contains(root))) continue;
+    uniqueRoots.push(root);
+  }
+  return uniqueRoots;
 }
 
 function clickOptionByQuestionAndLetter(number, letter) {
@@ -1159,9 +1743,6 @@ function clickOptionByQuestionAndLetter(number, letter) {
   if (!optionRoot) return { ok: false, reason: `nao encontrei a alternativa ${letter} na questao ${number}` };
   optionRoot.scrollIntoView({ block: 'center', inline: 'center' });
   optionRoot.click();
-  optionRoot.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
-  optionRoot.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
-  optionRoot.dispatchEvent(new MouseEvent('click', { bubbles: true }));
   return { ok: true };
 }
 
@@ -1174,9 +1755,6 @@ function clickOptionByQuestionTestId(number, letter) {
 
   optionRoot.scrollIntoView({ block: 'center', inline: 'center' });
   optionRoot.click();
-  optionRoot.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
-  optionRoot.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
-  optionRoot.dispatchEvent(new MouseEvent('click', { bubbles: true }));
   return { ok: true };
 }
 
@@ -1240,11 +1818,16 @@ function visible(element) {
 }
 
 async function collectEvaluations() {
+  currentEvaluationIndex = 0;
   await openUrl(EVALUATIONS_URL);
   await accessFirstEvaluation();
 }
 
 async function accessFirstEvaluation() {
+  await accessEvaluationByIndex(currentEvaluationIndex);
+}
+
+async function accessEvaluationByIndex(index) {
   await page.waitForFunction(() => document.body?.innerText?.includes('Minhas Disciplinas'), null, { timeout: 30000 }).catch(() => {});
 
   const selectors = [
@@ -1257,16 +1840,16 @@ async function accessFirstEvaluation() {
     '[role="button"]:has-text("Avaliações")',
   ];
 
-  const firstEvaluationButton = await waitForAnyVisible(selectors, 30000);
-  if (firstEvaluationButton) {
-    await firstEvaluationButton.click();
+  const evaluationButton = await waitForEvaluationButtonByIndex(index, selectors, 30000);
+  if (evaluationButton) {
+    await evaluationButton.click();
   } else {
-    const clicked = await page.evaluate(() => {
+    const clicked = await page.evaluate((targetIndex) => {
       const clean = (value) => (value || '').replace(/\s+/g, ' ').trim();
       const candidates = [...document.querySelectorAll('button, a, [role="button"], div, span, p')]
         .filter((element) => /^Avaliações$/i.test(clean(element.innerText || element.textContent)));
 
-      for (const candidate of candidates) {
+      for (const candidate of candidates.slice(targetIndex, targetIndex + 1)) {
         let card = candidate;
         for (let i = 0; i < 8 && card.parentElement; i += 1) {
           card = card.parentElement;
@@ -1286,17 +1869,37 @@ async function accessFirstEvaluation() {
       }
 
       return false;
-    });
+    }, index);
 
     if (!clicked) {
-      throw new Error('nao encontrei nenhum btn-acessar-avaliacoes na pagina de avaliacoes');
+      throw new Error(`nao encontrei btn-acessar-avaliacoes para a avaliacao ${index + 1}`);
     }
   }
   await page.waitForLoadState('domcontentloaded').catch(() => {});
   await page.waitForURL(/saladeavaliacoes\.com\.br\/avaliacoes\/[^/?]+\/?/, { timeout: 25000 }).catch(() => {});
   await page.waitForTimeout(2500);
-  console.log(`Acessei a primeira avaliacao: ${page.url()}`);
+  debugLog(`Acessei a avaliacao ${index + 1}: ${page.url()}`);
   await clickSimuladosIfAvailable();
+}
+
+async function waitForEvaluationButtonByIndex(index, selectors, totalTimeoutMs) {
+  const deadline = Date.now() + totalTimeoutMs;
+  while (Date.now() < deadline) {
+    for (const selector of selectors) {
+      const locator = page.locator(selector);
+      try {
+        const count = await locator.count();
+        if (count > index) {
+          const button = locator.nth(index);
+          if (await button.isVisible({ timeout: 500 })) return button;
+        }
+      } catch {
+        // Tenta o proximo seletor.
+      }
+    }
+    await page.waitForTimeout(500);
+  }
+  return null;
 }
 
 async function clickSimuladosIfAvailable() {
@@ -1314,7 +1917,8 @@ async function clickSimuladosIfAvailable() {
   }).catch(() => false);
 
   if (!hasSimulados) {
-    console.log('Nao encontrei a opcao Simulados no sidebar.');
+    debugLog('Nao encontrei a opcao Simulados no sidebar.');
+    await clickProvaAvAndAccessOnline();
     return;
   }
 
@@ -1330,15 +1934,20 @@ async function clickSimuladosIfAvailable() {
 
   const button = await waitForAnyVisible(selectors, 15000);
   if (!button) {
-    console.log('Encontrei Simulados no sidebar, mas nao encontrei o botao button_avaliacao-Simulado.');
+    debugLog('Encontrei Simulados no sidebar, mas nao encontrei o botao button_avaliacao-Simulado.');
+    await clickProvaAvAndAccessOnline();
     return;
   }
 
   await button.click();
   await page.waitForLoadState('domcontentloaded').catch(() => {});
   await page.waitForTimeout(1500);
-  console.log(`Cliquei em Simulados: ${page.url()}`);
-  await accessFirstPendingSimulation();
+  debugLog(`Cliquei em Simulados: ${page.url()}`);
+  const accessedSimulation = await accessFirstPendingSimulation();
+  if (!accessedSimulation) {
+    debugLog('Nao ha simulado disponivel para acessar. Vou tentar Prova AV.');
+    await clickProvaAvAndAccessOnline();
+  }
 }
 
 async function accessFirstPendingSimulation() {
@@ -1400,19 +2009,201 @@ async function accessFirstPendingSimulation() {
   });
 
   if (!result.ok) {
-    console.log(result.reason);
+    debugLog(result.reason);
+    return false;
+  }
+
+  await page.waitForLoadState('domcontentloaded').catch(() => {});
+  await page.waitForTimeout(1500);
+  debugLog(`Cliquei no simulado disponivel (${result.label}): ${page.url()}`);
+  await handleSimulationAfterAccess();
+  return true;
+}
+
+async function clickProvaAvAndAccessOnline() {
+  await page.waitForLoadState('domcontentloaded').catch(() => {});
+  await page.waitForTimeout(800);
+
+  const provaAvButton = await waitForAnyVisible([
+    '[data-element="button_avaliacao-Prova AV"]',
+    '[data-testid="evaluation-type-Prova AV-test-id"]',
+    '[data-testid="button_avaliacao-Prova AV"]',
+    'button[title="Prova AV"]',
+    'button:has-text("Prova AV")',
+    '[role="button"]:has-text("Prova AV")',
+  ], 12000);
+
+  if (provaAvButton) {
+    await provaAvButton.click();
+  } else {
+    const clicked = await page.evaluate(() => {
+      const clean = (value) => (value || '').replace(/\s+/g, ' ').trim();
+      const isVisible = (element) => {
+        if (!element || !(element instanceof Element)) return false;
+        const style = window.getComputedStyle(element);
+        const rect = element.getBoundingClientRect();
+        return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+      };
+      const sidebars = [...document.querySelectorAll('.sidebar-box-wrapper, [class*="sidebar-box-wrapper"], aside, nav')];
+      const candidates = sidebars.length > 0 ? sidebars.flatMap((sidebar) => [...sidebar.querySelectorAll('button, [role="button"], a, div, span')]) : [...document.querySelectorAll('button, [role="button"], a')];
+      const element = candidates.find((candidate) => isVisible(candidate) && /^Prova AV$/i.test(clean(candidate.innerText || candidate.textContent)));
+      const clickable = element?.closest('button, [role="button"], a') || element;
+      if (!clickable) return false;
+      clickable.scrollIntoView({ block: 'center', inline: 'center' });
+      clickable.click();
+      return true;
+    });
+
+    if (!clicked) {
+      statusEvaluation('Finalizada');
+      await goToNextEvaluation();
+      return;
+    }
+  }
+
+  await page.waitForLoadState('domcontentloaded').catch(() => {});
+  await page.waitForTimeout(1500);
+  debugLog(`Cliquei em Prova AV: ${page.url()}`);
+
+  const result = await accessOnlineProvaAvCard();
+  if (!result.ok) {
+    statusEvaluation('Finalizada');
+    await goToNextEvaluation();
     return;
   }
 
   await page.waitForLoadState('domcontentloaded').catch(() => {});
   await page.waitForTimeout(1500);
-  console.log(`Cliquei no simulado disponivel (${result.label}): ${page.url()}`);
+  debugLog(`Cliquei na Prova AV online (${result.label}): ${page.url()}`);
   await handleSimulationAfterAccess();
+}
+
+async function goToNextEvaluation() {
+  const nextIndex = currentEvaluationIndex + 1;
+
+  const backButton = await waitForAnyVisible([
+    'button.css-lh6f9h',
+    '.css-lh6f9h',
+    'button[aria-label*="Voltar" i]',
+    '[role="button"][aria-label*="Voltar" i]',
+    'button:has-text("Voltar")',
+    '[role="button"]:has-text("Voltar")',
+  ], 8000);
+
+  if (backButton) {
+    await backButton.click().catch(() => {});
+    await page.waitForLoadState('domcontentloaded').catch(() => {});
+    await page.waitForTimeout(1500);
+    debugLog('Cliquei em voltar para escolher a proxima avaliacao.');
+  } else {
+    debugLog('Nao encontrei o botao voltar; vou abrir a lista de avaliacoes diretamente.');
+  }
+
+  if (!page.url().includes('estudante.estacio.br/avaliacoes')) {
+    await openUrl(EVALUATIONS_URL);
+  }
+
+  await page.waitForFunction(() => document.body?.innerText?.includes('Minhas Disciplinas'), null, { timeout: 30000 }).catch(() => {});
+  const totalEvaluations = await countEvaluationButtons();
+  if (nextIndex >= totalEvaluations) {
+    await shutdownAndExit();
+    return;
+  }
+
+  currentEvaluationIndex = nextIndex;
+  debugLog(`Vou tentar a proxima avaliacao: quadrado ${currentEvaluationIndex + 1}.`);
+  await accessEvaluationByIndex(currentEvaluationIndex);
+}
+
+async function countEvaluationButtons() {
+  const selectors = [
+    '[data-testid="btn-acessar-avaliacoes"]',
+    '#btn-acessar-avaliacoes',
+    '.btn-acessar-avaliacoes',
+    'button.btn-acessar-avaliacoes',
+    'a.btn-acessar-avaliacoes',
+  ];
+
+  for (const selector of selectors) {
+    const count = await page.locator(selector).count().catch(() => 0);
+    if (count > 0) return count;
+  }
+
+  return page.evaluate(() => {
+    const clean = (value) => (value || '').replace(/\s+/g, ' ').trim();
+    return [...document.querySelectorAll('button, a, [role="button"], div, span, p')]
+      .filter((element) => /^Avalia(?:c|\u00e7)(?:o|\u00f5)es$/i.test(clean(element.innerText || element.textContent)))
+      .length;
+  }).catch(() => 0);
+}
+
+async function shutdownAndExit() {
+  rl.close();
+  await context.close().catch(() => {});
+  process.exit(0);
+}
+
+async function accessOnlineProvaAvCard() {
+  const result = await page.evaluate(() => {
+    const clean = (value) => (value || '').replace(/\s+/g, ' ').trim();
+    const isVisible = (element) => {
+      if (!element || !(element instanceof Element)) return false;
+      const style = window.getComputedStyle(element);
+      if (style.visibility === 'hidden' || style.display === 'none' || Number(style.opacity) === 0) return false;
+      const rect = element.getBoundingClientRect();
+      return rect.width > 0 && rect.height > 0;
+    };
+    const isEnabled = (element) => !element.disabled && element.getAttribute('aria-disabled') !== 'true';
+    const buttonText = (element) => clean(element.innerText || element.textContent);
+
+    const cards = [...document.querySelectorAll('.lft-cardshape, [class*="lft-cardshape"], section, article, li, div')]
+      .filter(isVisible)
+      .map((element) => ({ element, text: clean(element.innerText || element.textContent) }))
+      .filter(({ text }) => /Online/i.test(text) && text.length > 20 && text.length < 1800)
+      .filter(({ element }) => element.querySelector('.css-1mvqbuv, [class*="css-1mvqbuv"], button, a, [role="button"], .css-1ujby1e'))
+      .sort((a, b) => {
+        const priority = ({ text }) => {
+          if (/N(?:a|\u00e3)o realizada|Acessar|Continuar|Retomar/i.test(text) && !/gabarito/i.test(text)) return 0;
+          if (!/Realizada em|Acessar gabarito/i.test(text)) return 1;
+          return 9;
+        };
+        return priority(a) - priority(b) || a.text.length - b.text.length;
+      });
+
+    for (const { element: card, text: cardText } of cards) {
+      const hasOnlineBadge =
+        [...card.querySelectorAll('.css-1mvqbuv, [class*="css-1mvqbuv"], span, div')]
+          .some((element) => isVisible(element) && /^Online$/i.test(clean(element.innerText || element.textContent))) ||
+        /\bOnline\b/i.test(cardText);
+      if (!hasOnlineBadge) continue;
+      if (/Acessar gabarito/i.test(cardText)) continue;
+
+      const clickableCandidates = [
+        ...card.querySelectorAll('button, a, [role="button"], .css-1ujby1e'),
+      ].filter(isVisible).filter(isEnabled);
+
+      const accessButton = clickableCandidates.find((element) => {
+        const text = buttonText(element);
+        if (/gabarito/i.test(text)) return false;
+        return /^(Acessar|Continuar|Retomar)$/i.test(text) || element.classList.contains('css-1ujby1e');
+      });
+
+      if (accessButton) {
+        accessButton.scrollIntoView({ block: 'center', inline: 'center' });
+        accessButton.click();
+        return { ok: true, label: buttonText(accessButton) || accessButton.className };
+      }
+    }
+
+    return { ok: false, reason: 'Nao encontrei card online de Prova AV com botao Acessar, Continuar ou Retomar.' };
+  });
+
+  return result;
 }
 
 async function handleSimulationAfterAccess() {
   if (await waitForExamQuestionsReady(5000)) {
-    console.log('A prova ja estava aberta. Vou executar o comando prompt automaticamente.');
+    debugLog('A prova ja estava aberta. Vou executar o comando prompt automaticamente.');
     await savePromptForChat();
     return;
   }
@@ -1427,7 +2218,7 @@ async function handleSimulationAfterAccess() {
     return;
   }
 
-  console.log('Acessei o simulado, mas ainda nao encontrei a tela de orientacoes nem as questoes.');
+  debugLog('Acessei o simulado, mas ainda nao encontrei a tela de orientacoes nem as questoes.');
 }
 
 async function acceptInstructionsAndStartExam() {
@@ -1442,7 +2233,7 @@ async function acceptInstructionsAndStartExam() {
   const accepted = await markInstructionCheckboxes();
 
   if (!accepted.ok) {
-    console.log(accepted.reason || 'Nao consegui marcar as duas checkbox de orientacao.');
+    debugLog(accepted.reason || 'Nao consegui marcar as duas checkbox de orientacao.');
     return;
   }
 
@@ -1489,26 +2280,37 @@ async function acceptInstructionsAndStartExam() {
       return true;
     });
     if (!clicked) {
-      console.log('Checkboxes marcadas, mas nao encontrei o botao Comecar Prova.');
+      debugLog('Checkboxes marcadas, mas nao encontrei o botao Comecar Prova.');
       return;
     }
   }
 
   await page.waitForLoadState('domcontentloaded').catch(() => {});
   await page.waitForTimeout(1500);
-  console.log(`Comecei a prova: ${page.url()}`);
+  debugLog(`Comecei a prova: ${page.url()}`);
   await runPromptAutomaticallyAfterExamStart();
 }
 
 async function runPromptAutomaticallyAfterExamStart() {
   const ready = await waitForExamQuestionsReady(30000);
   if (!ready) {
-    console.log('Prova iniciada, mas ainda nao encontrei as questoes para gerar o prompt automaticamente.');
+    debugLog('Prova iniciada, mas ainda nao encontrei as questoes para gerar o prompt automaticamente.');
     return;
   }
 
-  console.log('Questoes carregadas. Vou executar o comando prompt automaticamente.');
-  await savePromptForChat();
+  debugLog('Questoes carregadas. Vou executar o comando prompt automaticamente.');
+  await savePromptForChat({ finalize: true });
+}
+
+async function runExercisePromptAutomaticallyAfterStart() {
+  const ready = await waitForExamQuestionsReady(30000);
+  if (!ready) {
+    debugLog('Exercicio aberto, mas ainda nao encontrei as questoes para gerar o prompt automaticamente.');
+    return;
+  }
+
+  debugLog('Questoes do exercicio carregadas. Vou executar o comando prompt automaticamente.');
+  await savePromptForChat({ finalize: false });
 }
 
 async function waitForExamQuestionsReady(totalTimeoutMs) {
@@ -1516,7 +2318,12 @@ async function waitForExamQuestionsReady(totalTimeoutMs) {
   while (Date.now() < deadline) {
     const ready = await page.evaluate(() => {
       const text = document.body?.innerText || '';
-      return /Marcar para revis(?:a|\u00e3)o/i.test(text) || /Quest(?:a|\u00e3)o\s*1/i.test(text);
+      return (
+        !!document.querySelector('[data-testid^="question-"]') ||
+        /Marcar para revis(?:a|\u00e3)o/i.test(text) ||
+        /Quest(?:a|\u00e3)o\s*1/i.test(text) ||
+        /Quest(?:a|\u00e3)o\s*1\s*de\s*10/i.test(text)
+      );
     }).catch(() => false);
     if (ready) return true;
 
@@ -1653,8 +2460,8 @@ async function findInstructionCheckboxPoint(patternSource) {
 
 async function collectEvaluationsIfLoggedIn() {
   if (!page.url().includes('estudante.estacio.br/disciplinas')) return;
-  if (!(await isLoggedInEstacio())) return;
 
-  console.log('Usuario logado detectado em disciplinas. Vou abrir avaliacoes e acessar a primeira prova.');
+  debugLog('Pagina de disciplinas aberta. Vou abrir avaliacoes e acessar a primeira prova.');
   await collectEvaluations();
 }
+

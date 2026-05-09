@@ -1,6 +1,7 @@
 node_modules/
 .browser-profile/
 .chrome-chatgpt-profile/
+user.env
 
 prompt-prova.txt
 respostas.txt
