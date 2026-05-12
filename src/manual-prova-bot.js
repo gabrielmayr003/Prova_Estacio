@@ -3,7 +3,7 @@ import readline from 'node:readline/promises';
 import { spawn } from 'node:child_process';
 import { stdin as input, stdout as output } from 'node:process';
 import { existsSync } from 'node:fs';
-import { readFile, writeFile } from 'node:fs/promises';
+import { readFile, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 
 const USER_DATA_DIR = path.resolve('.browser-profile');
@@ -17,6 +17,8 @@ const EVALUATIONS_URL = 'https://estudante.estacio.br/avaliacoes';
 const CHROME_EXE = 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe';
 const CHATGPT_PROVAS_URL = 'https://chatgpt.com/c/69ff2b24-07c4-83e9-b883-9f849ee8f433';
 const VALID_LETTERS = new Set(['A', 'B', 'C', 'D', 'E']);
+const TARGET_EXERCISE_THEME = Number(process.env.TEMA_EXERCICIO || 0);
+const STOP_AFTER_OPEN_EXERCISE = process.env.STOP_AFTER_OPEN_EXERCISE === '1';
 const ANSWER_PROMPT_TEMPLATE = `
 Voce e um especialista em { titulo prova } e vai resolver uma avaliacao objetiva.
 
@@ -43,26 +45,39 @@ let lastRead = null;
 let currentEvaluationIndex = 0;
 let currentExerciseTitle = '';
 
-const startMode = await askStartMode();
+const startMode = process.env.START_MODE
+  ? normalizeText(process.env.START_MODE)
+  : await askStartMode();
 
+await cleanupFirefoxSessionState();
+if (process.env.DEBUG_BOT === '1') console.log('Abrindo Firefox...');
 const context = await firefox.launchPersistentContext(USER_DATA_DIR, {
   headless: false,
   viewport: { width: 1366, height: 768 },
+  timeout: 45000,
 });
 
 const page = context.pages()[0] ?? await context.newPage();
 page.setDefaultTimeout(5000);
 
-const debugLog = () => {};
+const debugLog = process.env.DEBUG_BOT === '1' ? console.log.bind(console) : () => {};
 const statusEvaluation = (status) => {
   console.log(`Avalia\u00e7\u00e3o ${currentEvaluationIndex + 1}: ${status}.`);
 };
+const chatMinimizer = setInterval(() => {
+  void minimizePersonalAssistantChat().catch(() => {});
+}, 2000);
+chatMinimizer.unref?.();
 
-if (startMode === 'exercicio') {
-  await openExercisesFromHome();
-} else {
-  await openUrl(DEFAULT_SITE_URL);
-  await collectEvaluationsIfLoggedIn();
+try {
+  if (startMode === 'exercicio') {
+    await openExercisesFromHome();
+  } else {
+    await openUrl(DEFAULT_SITE_URL);
+    await collectEvaluationsIfLoggedIn();
+  }
+} catch (error) {
+  console.log(`Nao consegui executar o inicio automatico: ${error.message}`);
 }
 printBanner();
 
@@ -99,8 +114,10 @@ try {
     }
   }
 } finally {
+  clearInterval(chatMinimizer);
   rl.close();
   await context.close();
+  await cleanupFirefoxSessionState();
 }
 
 async function askPrompt() {
@@ -153,6 +170,22 @@ Comandos:
 `);
 }
 
+async function cleanupFirefoxSessionState() {
+  const volatileProfileItems = [
+    'parent.lock',
+    '.startup-incomplete',
+    'sessionstore.jsonlz4',
+    'sessionstore-backups',
+    'sessionCheckpoints.json',
+    'startupCache',
+    'xulstore.json',
+  ];
+
+  await Promise.all(volatileProfileItems.map((item) => (
+    rm(path.join(USER_DATA_DIR, item), { recursive: true, force: true }).catch(() => {})
+  )));
+}
+
 function buildExamUrl(keyOrUrl) {
   if (/^https?:\/\//i.test(keyOrUrl)) return keyOrUrl;
   const key = keyOrUrl.replace(/^\/+|\/+$/g, '');
@@ -174,39 +207,343 @@ async function openUrl(rawUrl) {
   const url = /^https?:\/\//i.test(rawUrl) ? rawUrl : `https://${rawUrl}`;
   await page.goto(url, { waitUntil: 'domcontentloaded' });
   await page.waitForTimeout(500);
+  await minimizePersonalAssistantChat();
   debugLog(`Aberto: ${url}`);
 }
 
+async function minimizePersonalAssistantChat() {
+  const minimized = await page.evaluate(() => {
+    const section = document.querySelector('[data-testid="section-chat-assistente-pessoal"]');
+    if (!section) return false;
+
+    const button =
+      section.querySelector('[data-testid="minimize-button"]') ||
+      section.querySelector('[data-element="button_minimizar-chat-interno"]') ||
+      section.querySelector('button[aria-label="Minimizar chat"]') ||
+      document.querySelector('button[data-testid="minimize-button"]') ||
+      document.querySelector('button[data-element="button_minimizar-chat-interno"]');
+
+    const clickable = button?.closest('button, [role="button"]') || button;
+    if (!clickable) return false;
+
+    clickable.scrollIntoView({ block: 'center', inline: 'center' });
+    clickable.click();
+    clickable.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: window }));
+    clickable.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, view: window }));
+    clickable.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+    return true;
+  }).catch(() => false);
+
+  if (minimized) {
+    await page.waitForTimeout(300);
+    return true;
+  }
+
+  return false;
+}
+
 async function openExercisesFromHome() {
+  debugLog('Exercicio: abrindo inicio.');
   await openUrl(HOME_URL);
   await page.waitForLoadState('domcontentloaded').catch(() => {});
   await page.waitForTimeout(1000);
 
+  debugLog('Exercicio: abrindo sidebar.');
   await openHomeSidebar();
   await page.waitForTimeout(500);
 
+  debugLog('Exercicio: abrindo Meu curso.');
   const openedCourseMenu = await clickMenuMeuCurso();
   if (!openedCourseMenu) throw new Error('nao encontrei o menu Meu curso na sidebar');
   await page.waitForTimeout(500);
 
+  debugLog('Exercicio: clicando em Disciplinas.');
   const clicked = await clickMenuDisciplinas();
   if (!clicked) throw new Error('nao encontrei "Disciplinas" na sidebar do inicio');
 
   await page.waitForLoadState('domcontentloaded').catch(() => {});
   await page.waitForTimeout(1000);
-  await openExerciseProgressCard();
+  debugLog('Exercicio: escondendo menu.');
+  await hideExercisesSidebar();
+  debugLog('Exercicio: abrindo card Lista de Exercicios.');
+  await openExercisesCardFromDisciplines();
 }
 
-async function openExerciseProgressCard() {
-  await hideExercisesSidebar();
-  currentExerciseTitle = await readExercisePageTitle();
+async function openExercisesCardFromDisciplines() {
+  debugLog('Exercicio: procurando card-progresso-semestre-exercicio.');
+  const clicked = await clickVisibleBySelectors([
+    '[data-testid="lista-card-progresso-semestre"] [data-testid="card-progresso-semestre-exercicio"]',
+    '[data-testid="lista-card-progresso-semestre"] [data-element="card-progresso-semestre-exercicio"]',
+    '[data-testid="lista-card-progresso-semestre"] [data-element="button_exercicios"]',
+    '[data-testid="progresso-semestre-container"] [data-testid="card-progresso-semestre-exercicio"]',
+    '[data-testid="progresso-semestre-container"] [data-element="card-progresso-semestre-exercicio"]',
+    '[data-testid="card-progresso-semestre-exercicio"]',
+    '[data-element="card-progresso-semestre-exercicio"]',
+    '[data-element="button_exercicios"]',
+  ], 4000);
 
-  const clicked = await clickExerciseProgressCard();
-  if (!clicked) throw new Error('nao encontrei o card card-progresso-semestre-exercicio');
+  if (!clicked) {
+    const fallback = await page.evaluate(() => {
+      const isVisible = (element) => {
+        if (!element || !(element instanceof Element)) return false;
+        const style = window.getComputedStyle(element);
+        const rect = element.getBoundingClientRect();
+        return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+      };
+
+      const roots = [...document.querySelectorAll('[data-testid="lista-card-progresso-semestre"], [data-testid="progresso-semestre-container"], [data-lift="lft-cardshape"], .css-6lcv8m, .css-12kbgrh')];
+      const candidates = (roots.length > 0 ? roots : [document.body])
+        .flatMap((root) => [...root.querySelectorAll('[data-element], [data-testid], button, [role="button"], a, div')]);
+      const card = candidates.find((element) => {
+        const dataElement = element.getAttribute('data-element') || '';
+        const dataTestId = element.getAttribute('data-testid') || '';
+        const text = (element.innerText || element.textContent || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
+        return isVisible(element) && (
+          dataElement === 'button_exercicios' ||
+          dataTestId === 'button_exercicios' ||
+          dataTestId === 'card-progresso-semestre-exercicio' ||
+          dataElement === 'card-progresso-semestre-exercicio' ||
+          text.includes('lista de exercicios')
+        );
+      });
+
+      const clickable = card?.closest('button, [role="button"], a') || card;
+      if (!clickable) return false;
+      clickable.scrollIntoView({ block: 'center', inline: 'center' });
+      clickable.click();
+      return true;
+    }).catch(() => false);
+
+    if (!fallback) throw new Error('nao encontrei o card card-progresso-semestre-exercicio');
+  }
 
   await page.waitForLoadState('domcontentloaded').catch(() => {});
   await page.waitForTimeout(1000);
+  debugLog('Exercicio: clicando na disciplina dentro de Lista de Exercicios.');
+  await clickFirstExerciseDisciplineButton();
+  debugLog('Exercicio: clicando menu Lista de Exercicios.');
+  await clickExerciseListMenuItem();
+  debugLog('Exercicio: procurando tema pendente.');
+  await clickFirstPendingExerciseTheme();
+  currentExerciseTitle = await readExercisePageTitle();
   await runExercisePromptAutomaticallyAfterStart();
+}
+
+async function clickFirstExerciseDisciplineButton() {
+  const clicked = await clickVisibleBySelectors([
+    '[data-lift="lft-cardshape"] button[data-testid="botao-acessar-disciplina"]',
+    '[data-lift="lft-cardshape"] button[data-element^="button_acessar-disciplina"]',
+    '.css-6lcv8m button[data-testid="botao-acessar-disciplina"]',
+    '.css-6lcv8m button[data-element^="button_acessar-disciplina"]',
+    'button[data-testid="botao-acessar-disciplina"]',
+    'button[data-element^="button_acessar-disciplina"]',
+  ], 15000);
+
+  if (!clicked) {
+    const fallback = await page.evaluate(() => {
+      const isVisible = (element) => {
+        if (!element || !(element instanceof Element)) return false;
+        const style = window.getComputedStyle(element);
+        const rect = element.getBoundingClientRect();
+        return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+      };
+
+      const roots = [...document.querySelectorAll('[data-lift="lft-cardshape"], .css-6lcv8m, .css-12kbgrh')];
+      const candidates = (roots.length > 0 ? roots : [document.body])
+        .flatMap((root) => [...root.querySelectorAll('button, [role="button"], a')]);
+      const button = candidates.find((element) => {
+        const dataElement = element.getAttribute('data-element') || '';
+        const dataTestId = element.getAttribute('data-testid') || '';
+        return isVisible(element) && (
+          dataTestId === 'botao-acessar-disciplina' ||
+          dataElement.startsWith('button_acessar-disciplina')
+        );
+      });
+
+      if (!button) return false;
+      button.scrollIntoView({ block: 'center', inline: 'center' });
+      button.click();
+      return true;
+    }).catch(() => false);
+
+    if (!fallback) throw new Error('nao encontrei o botao botao-acessar-disciplina');
+  }
+
+  await page.waitForLoadState('domcontentloaded').catch(() => {});
+  await forceDisciplineExercisesUrl();
+  debugLog(`Exercicio: URL da disciplina: ${page.url()}`);
+  await page.waitForTimeout(1200);
+}
+
+async function forceDisciplineExercisesUrl() {
+  await page.waitForFunction(() => /estudante\.estacio\.br\/disciplinas\/[^/]+/i.test(location.href), null, { timeout: 12000 }).catch(() => {});
+
+  const currentUrl = page.url();
+  const match = currentUrl.match(/^(https:\/\/estudante\.estacio\.br\/disciplinas\/[^/?#]+)(?:\/[^/?#]+)?([?#].*)?$/i);
+  if (!match) return;
+
+  const targetUrl = `${match[1]}/exercicios${match[2] || ''}`;
+  if (currentUrl !== targetUrl) {
+    await page.goto(targetUrl, { waitUntil: 'domcontentloaded' });
+  }
+
+  await page.waitForURL(/estudante\.estacio\.br\/disciplinas\/[^/]+\/exercicios/i, { timeout: 12000 }).catch(() => {});
+}
+
+async function clickExerciseListMenuItem() {
+  const clicked = await page.evaluate(() => {
+    const normalize = (value) => String(value || '')
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .toLowerCase();
+    const isVisible = (element) => {
+      if (!element || !(element instanceof Element)) return false;
+      const style = window.getComputedStyle(element);
+      const rect = element.getBoundingClientRect();
+      return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+    };
+
+    const root = document.querySelector('menu.css-g1721d') || document.querySelector('menu') || document.body;
+    const item = [...root.querySelectorAll('li, button, [role="button"], a, div, span')]
+      .filter(isVisible)
+      .find((element) => normalize(element.innerText || element.textContent) === 'lista de exercicios');
+    const clickable = item?.closest('button, [role="button"], a, li') || item;
+    if (!clickable) return false;
+    clickable.scrollIntoView({ block: 'center', inline: 'center' });
+    clickable.click();
+    return true;
+  }).catch(() => false);
+
+  if (!clicked) {
+    debugLog('Nao encontrei o menu Lista de Exercicios; vou seguir procurando tema pendente.');
+    return false;
+  }
+  await page.waitForLoadState('domcontentloaded').catch(() => {});
+  await page.waitForTimeout(800);
+  return true;
+}
+
+async function clickFirstPendingExerciseTheme() {
+  await page.waitForFunction(() => {
+    const text = document.body?.innerText || '';
+    return /Tema\s*\d+|Pendente|Conclu[ií]do/i.test(text);
+  }, null, { timeout: 20000 }).catch(() => {});
+
+  const result = await page.evaluate((targetTheme) => {
+    const normalize = (value) => String(value || '')
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .toLowerCase();
+    const isVisible = (element) => {
+      if (!element || !(element instanceof Element)) return false;
+      const style = window.getComputedStyle(element);
+      const rect = element.getBoundingClientRect();
+      return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+    };
+    const isEnabled = (element) => !element.disabled && element.getAttribute('aria-disabled') !== 'true';
+
+    const root =
+      document.querySelector('[data-testid="container-exercicios"]') ||
+      document.querySelector('[data-section="section_sava-exercicios-da-disciplina"]') ||
+      document.querySelector('section.css-klisov') ||
+      document.body;
+    const listRoot =
+      root.querySelector('[data-testid="grid-conteudos"]') ||
+      root.querySelector('.css-533vxd') ||
+      root;
+
+    const pendingFooters = [...listRoot.querySelectorAll('footer')]
+      .filter(isVisible)
+      .filter((footer) => {
+        const tag = footer.querySelector('[data-testid="card-tag"], [data-lift="lft-tag"], [aria-label="Pendente"]');
+        const tagText = normalize(tag?.innerText || tag?.textContent || tag?.getAttribute?.('aria-label'));
+        return tagText === 'pendente' || normalize(footer.innerText || footer.textContent).includes('pendente');
+      });
+
+    const pendingCards = pendingFooters
+      .map((footer) => footer.closest('section, article, [data-lift="lft-cardshape"], [class*="card"]') || footer.parentElement || footer)
+      .filter(Boolean);
+
+    const rawSections = [
+      ...pendingCards,
+      ...listRoot.querySelectorAll('section.css-pgnbd, .css-pgnbd.e1bzjf1t1, .css-pgnbd, section, article'),
+    ];
+    const byElement = new Map();
+    for (const section of rawSections) byElement.set(section, section);
+
+    for (const badge of [...listRoot.querySelectorAll('span, div, small, p')].filter(isVisible)) {
+      if (normalize(badge.innerText || badge.textContent) !== 'pendente') continue;
+      const card = badge.closest('section.css-pgnbd, .css-pgnbd.e1bzjf1t1, .css-pgnbd, section, article, [data-lift="lft-cardshape"], [class*="card"]');
+      if (card) byElement.set(card, card);
+    }
+
+    const sections = [...byElement.values()]
+      .filter(isVisible)
+      .map((section) => ({
+        section,
+        text: normalize(section.innerText || section.textContent),
+      }))
+      .filter(({ text }) => text.includes('tema') && text.includes('pendente') && text.length > 10 && text.length < 2500)
+      .sort((a, b) => a.text.length - b.text.length);
+
+    const exactTheme = (text) => targetTheme > 0 && new RegExp(`\\btema\\s*${targetTheme}\\b`).test(text);
+    const preferredSections = targetTheme > 0
+      ? [
+        ...sections.filter(({ text }) => exactTheme(text)),
+        ...sections.filter(({ text }) => !exactTheme(text)),
+      ]
+      : sections;
+
+    for (const { section, text: sectionText } of preferredSections) {
+      const footerButton = [...section.querySelectorAll('footer button[data-testid="card-sucesso-botao"], footer button[data-element^="button_acessar-exercicio"]')]
+        .filter(isVisible)
+        .filter(isEnabled)
+        .find((element) => {
+          const footer = element.closest('footer');
+          return normalize(footer?.innerText || footer?.textContent).includes('pendente');
+        });
+      const button = footerButton || [...section.querySelectorAll('button[data-testid="card-sucesso-botao"], button[data-element^="button_acessar-exercicio"], button')]
+        .filter(isVisible)
+        .filter(isEnabled)
+        .find((element) => (
+          element.getAttribute('data-testid') === 'card-sucesso-botao' ||
+          (element.getAttribute('data-element') || '').startsWith('button_acessar-exercicio') ||
+          /acessar/i.test(element.getAttribute('aria-label') || '')
+        ));
+      if (!button) continue;
+
+      button.scrollIntoView({ block: 'center', inline: 'center' });
+      button.click();
+      return { ok: true, url: location.href, chosen: sectionText.slice(0, 220) };
+    }
+
+    return {
+      ok: false,
+      url: location.href,
+      total: sections.length,
+      samples: sections.slice(0, 6).map(({ text }) => text.slice(0, 240)),
+      body: normalize(document.body?.innerText || document.body?.textContent || '').slice(0, 900),
+    };
+  }, TARGET_EXERCISE_THEME).catch(() => false);
+
+  if (!result?.ok) {
+    const samples = Array.isArray(result?.samples) && result.samples.length
+      ? ` Amostras: ${result.samples.join(' | ')}`
+      : '';
+    const body = result?.body ? ` Texto da pagina: ${result.body}` : '';
+    throw new Error(`nao encontrei tema pendente com botao card-sucesso-botao. URL: ${result?.url || page.url()}.${samples}${body}`);
+  }
+  await page.waitForLoadState('domcontentloaded').catch(() => {});
+  await page.waitForURL(/estacio\.saladeavaliacoes\.com\.br\/exercicio\//i, { timeout: 20000 }).catch(() => {});
+  await page.waitForTimeout(1200);
+  if (STOP_AFTER_OPEN_EXERCISE) {
+    console.log(`URL atual: ${page.url()}`);
+    await shutdownAndExit();
+  }
 }
 
 async function hideExercisesSidebar() {
@@ -218,7 +555,14 @@ async function hideExercisesSidebar() {
   ], 8000);
 
   if (hideButton) {
-    await hideButton.click({ force: true });
+    const clicked = await hideButton.click({ force: true, timeout: 1500 }).then(() => true).catch(() => false);
+    if (!clicked) {
+      await clickBySelectorsDom([
+        'button.css-x43dmm',
+        '.css-x43dmm',
+        'button[alt="Esconder Menu"]',
+      ]);
+    }
     await page.waitForTimeout(500);
   }
 }
@@ -347,17 +691,25 @@ async function openHomeSidebar() {
 
   const menu = await waitForAnyVisible(menuSelectors, 8000);
   if (menu) {
-    await menu.click({ force: true }).catch(async () => {
+    const clicked = await menu.click({ force: true, timeout: 1500 }).then(() => true).catch(async () => {
       const parentButton = menu.locator('xpath=ancestor-or-self::button[1]').first();
-      if (await parentButton.count().catch(() => 0)) await parentButton.click({ force: true });
+      if (await parentButton.count().catch(() => 0)) {
+        return parentButton.click({ force: true, timeout: 1500 }).then(() => true).catch(() => false);
+      }
+      return false;
     });
-    return true;
+    if (clicked) return true;
   }
 
   return page.evaluate(() => {
-    const svg = document.querySelector('svg.menu');
-    const clickable = svg?.closest('button, [role="button"], a') || svg;
+    const svg = document.querySelector('svg.menu, .menu');
+    const clickable =
+      svg?.closest('button, [role="button"], a') ||
+      document.querySelector('button[alt="Abrir Menu"], button[aria-label*="menu" i], [role="button"][aria-label*="menu" i]');
     if (!clickable) return false;
+    clickable.scrollIntoView({ block: 'center', inline: 'center' });
+    clickable.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: window }));
+    clickable.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, view: window }));
     clickable.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
     return true;
   }).catch(() => false);
@@ -396,10 +748,44 @@ async function clickMenuDisciplinas() {
 }
 
 async function clickVisibleBySelectors(selectors, timeoutMs) {
+  await minimizePersonalAssistantChat();
   const locator = await waitForAnyVisible(selectors, timeoutMs);
   if (!locator) return false;
-  await locator.click({ force: true });
-  return true;
+  await minimizePersonalAssistantChat();
+  const clicked = await locator.click({ force: true, timeout: 1500 }).then(() => true).catch(() => false);
+  if (clicked) return true;
+  return clickBySelectorsDom(selectors);
+}
+
+async function clickBySelectorsDom(selectors) {
+  return page.evaluate((selectorList) => {
+    const isVisible = (element) => {
+      if (!element || !(element instanceof Element)) return false;
+      const style = window.getComputedStyle(element);
+      const rect = element.getBoundingClientRect();
+      return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+    };
+
+    for (const selector of selectorList) {
+      if (selector.includes(':has-text') || selector.includes(':has(')) continue;
+      let element = null;
+      try {
+        element = document.querySelector(selector);
+      } catch {
+        continue;
+      }
+
+      const clickable = element?.closest?.('button, [role="button"], a, li, [tabindex]') || element;
+      if (!clickable || !isVisible(clickable)) continue;
+      clickable.scrollIntoView({ block: 'center', inline: 'center' });
+      clickable.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: window }));
+      clickable.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, view: window }));
+      clickable.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+      return true;
+    }
+
+    return false;
+  }, selectors).catch(() => false);
 }
 
 async function clickSidebarItemByText(targetText) {
@@ -414,8 +800,10 @@ async function clickSidebarItemByText(targetText) {
 
   const direct = await waitForAnyVisible(directSelectors, 5000);
   if (direct) {
-    await direct.click();
-    return true;
+    await minimizePersonalAssistantChat();
+    const clicked = await direct.click({ timeout: 1500 }).then(() => true).catch(() => false);
+    if (clicked) return true;
+    return clickBySelectorsDom(directSelectors);
   }
 
   return page.evaluate((wantedText) => {
@@ -567,6 +955,7 @@ async function fillPasswordEstacioIfVisible() {
 async function waitForAnyVisible(selectors, totalTimeoutMs) {
   const deadline = Date.now() + totalTimeoutMs;
   while (Date.now() < deadline) {
+    await minimizePersonalAssistantChat().catch(() => {});
     for (const selector of selectors) {
       const locator = page.locator(selector).first();
       try {
@@ -765,19 +1154,44 @@ async function openChatGptInChrome(prompt) {
     return '';
   }
 
-  const hasChrome = process.platform === 'win32'
-    ? (await runPowerShell("if (Get-Process chrome -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowHandle -ne 0 }) { 'yes' }").catch(() => '')).trim() === 'yes'
-    : false;
+  const chromeState = process.platform === 'win32'
+    ? (await runPowerShell(`
+        $chrome = Get-Process chrome -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowHandle -ne 0 }
+        if (-not $chrome) {
+          'none'
+        } elseif ($chrome | Where-Object { $_.MainWindowTitle -match 'ChatGPT|Provas' }) {
+          'chatgpt'
+        } else {
+          'chrome'
+        }
+      `).catch(() => '')).trim()
+    : '';
+
+  const hasChrome = chromeState === 'chrome' || chromeState === 'chatgpt';
+  const hasChatGptChrome = chromeState === 'chatgpt';
 
   if (!hasChrome) {
     const child = spawn(CHROME_EXE, [CHATGPT_PROVAS_URL], { detached: true, stdio: 'ignore' });
     child.unref();
-    debugLog('Chrome aberto no chat Provas.');
+    debugLog('Chrome aberto direto no chat Provas.');
+  } else if (!hasChatGptChrome) {
+    const child = spawn(CHROME_EXE, [CHATGPT_PROVAS_URL], { detached: true, stdio: 'ignore' });
+    child.unref();
+    debugLog('Chrome ja estava aberto; abri a conversa Provas no Chrome.');
   } else {
-    debugLog('Chrome ja esta aberto. Vou reutilizar a aba atual e navegar para o chat Provas se precisar.');
+    debugLog('Conversa do ChatGPT detectada no Chrome. Vou usar o chat Provas.');
   }
 
-  debugLog('Vou tentar colar, enviar e copiar a resposta.');
+  const hasChromeAfterOpen = process.platform === 'win32'
+    ? (await runPowerShell("if (Get-Process chrome -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowHandle -ne 0 }) { 'yes' }").catch(() => '')).trim() === 'yes'
+    : false;
+
+  if (!hasChromeAfterOpen) {
+    debugLog('Nao consegui confirmar uma janela do Chrome. O prompt ja esta copiado.');
+    return '';
+  }
+
+  debugLog('Vou focar o Chrome, abrir a conversa Provas, colar, enviar e copiar a resposta.');
   return pasteSendAndCopyChat(prompt);
 }
 
@@ -2138,8 +2552,10 @@ async function countEvaluationButtons() {
 }
 
 async function shutdownAndExit() {
+  clearInterval(chatMinimizer);
   rl.close();
   await context.close().catch(() => {});
+  await cleanupFirefoxSessionState();
   process.exit(0);
 }
 
@@ -2464,4 +2880,3 @@ async function collectEvaluationsIfLoggedIn() {
   debugLog('Pagina de disciplinas aberta. Vou abrir avaliacoes e acessar a primeira prova.');
   await collectEvaluations();
 }
-
