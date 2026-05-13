@@ -44,6 +44,8 @@ const rl = readline.createInterface({ input, output });
 let lastRead = null;
 let currentEvaluationIndex = 0;
 let currentExerciseTitle = '';
+let currentExerciseListUrl = '';
+const processedExerciseThemeKeys = new Set();
 
 const startMode = process.env.START_MODE
   ? normalizeText(process.env.START_MODE)
@@ -321,12 +323,10 @@ async function openExercisesCardFromDisciplines() {
   await page.waitForTimeout(1000);
   debugLog('Exercicio: clicando na disciplina dentro de Lista de Exercicios.');
   await clickFirstExerciseDisciplineButton();
+  currentExerciseListUrl = page.url();
   debugLog('Exercicio: clicando menu Lista de Exercicios.');
   await clickExerciseListMenuItem();
-  debugLog('Exercicio: procurando tema pendente.');
-  await clickFirstPendingExerciseTheme();
-  currentExerciseTitle = await readExercisePageTitle();
-  await runExercisePromptAutomaticallyAfterStart();
+  await processPendingExerciseThemes();
 }
 
 async function clickFirstExerciseDisciplineButton() {
@@ -425,13 +425,89 @@ async function clickExerciseListMenuItem() {
   return true;
 }
 
-async function clickFirstPendingExerciseTheme() {
+async function processPendingExerciseThemes() {
+  for (let attempt = 1; attempt <= 20; attempt += 1) {
+    await ensureExerciseListPage();
+    const skippedKeys = [...processedExerciseThemeKeys];
+    const pendingCount = await countPendingExerciseThemes(skippedKeys);
+    debugLog(`Exercicio: temas pendentes nesta disciplina: ${pendingCount}.`);
+
+    if (pendingCount <= 0) {
+      debugLog('Exercicio: nao ha mais temas pendentes nesta disciplina.');
+      return;
+    }
+
+    debugLog(`Exercicio: abrindo tema pendente ${attempt}.`);
+    const openedTheme = await clickFirstPendingExerciseTheme(skippedKeys);
+    if (openedTheme?.key) processedExerciseThemeKeys.add(openedTheme.key);
+    currentExerciseTitle = await readExercisePageTitle();
+    await runExercisePromptAutomaticallyAfterStart({ returnToListUrl: currentExerciseListUrl });
+  }
+
+  debugLog('Exercicio: parei apos 20 tentativas para evitar loop infinito.');
+}
+
+async function ensureExerciseListPage() {
+  if (!currentExerciseListUrl) currentExerciseListUrl = page.url();
+
+  if (!/estudante\.estacio\.br\/disciplinas\/[^/]+\/exercicios/i.test(page.url())) {
+    await page.goto(currentExerciseListUrl, { waitUntil: 'domcontentloaded' });
+  }
+
+  await page.waitForLoadState('domcontentloaded').catch(() => {});
+  await page.waitForFunction(() => {
+    const text = document.body?.innerText || '';
+    return /Lista de Exerc[ií]cios da disciplina|Tema\s*\d+|Pendente|Conclu[ií]do/i.test(text);
+  }, null, { timeout: 20000 }).catch(() => {});
+  await page.waitForTimeout(800);
+}
+
+async function countPendingExerciseThemes(skippedKeys = []) {
+  return page.evaluate((skipList) => {
+    const skipped = new Set(skipList);
+    const normalize = (value) => String(value || '')
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .toLowerCase();
+    const isVisible = (element) => {
+      if (!element || !(element instanceof Element)) return false;
+      const style = window.getComputedStyle(element);
+      const rect = element.getBoundingClientRect();
+      return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+    };
+
+    const root =
+      document.querySelector('[data-testid="container-exercicios"]') ||
+      document.querySelector('[data-section="section_sava-exercicios-da-disciplina"]') ||
+      document.body;
+    const grid = root.querySelector('[data-testid="grid-conteudos"]') || root;
+    return [...grid.querySelectorAll('[data-testid="card-tag"], [data-lift="lft-tag"], [aria-label="Pendente"]')]
+      .filter(isVisible)
+      .filter((tag) => {
+        const text = normalize(tag.innerText || tag.textContent || tag.getAttribute('aria-label'));
+        if (text !== 'pendente') return false;
+        const card = tag.closest('section, article, [data-lift="lft-cardshape"], [class*="card"]') || tag.closest('footer') || tag;
+        const button = card.querySelector('button[data-testid="card-sucesso-botao"], button[data-element^="button_acessar-exercicio"], button[aria-label*="Acessar" i]');
+        const key =
+          button?.getAttribute('data-info') ||
+          button?.getAttribute('data-element') ||
+          normalize(card.innerText || card.textContent).slice(0, 180);
+        return !skipped.has(key);
+      })
+      .length;
+  }, skippedKeys).catch(() => 0);
+}
+
+async function clickFirstPendingExerciseTheme(skippedKeys = []) {
   await page.waitForFunction(() => {
     const text = document.body?.innerText || '';
     return /Tema\s*\d+|Pendente|Conclu[ií]do/i.test(text);
   }, null, { timeout: 20000 }).catch(() => {});
 
-  const result = await page.evaluate((targetTheme) => {
+  const result = await page.evaluate(({ targetTheme, skipList }) => {
+    const skipped = new Set(skipList);
     const normalize = (value) => String(value || '')
       .normalize('NFD')
       .replace(/[\u0300-\u036f]/g, '')
@@ -516,9 +592,15 @@ async function clickFirstPendingExerciseTheme() {
         ));
       if (!button) continue;
 
+      const key =
+        button.getAttribute('data-info') ||
+        button.getAttribute('data-element') ||
+        sectionText.slice(0, 180);
+      if (skipped.has(key)) continue;
+
       button.scrollIntoView({ block: 'center', inline: 'center' });
       button.click();
-      return { ok: true, url: location.href, chosen: sectionText.slice(0, 220) };
+      return { ok: true, url: location.href, chosen: sectionText.slice(0, 220), key };
     }
 
     return {
@@ -528,7 +610,7 @@ async function clickFirstPendingExerciseTheme() {
       samples: sections.slice(0, 6).map(({ text }) => text.slice(0, 240)),
       body: normalize(document.body?.innerText || document.body?.textContent || '').slice(0, 900),
     };
-  }, TARGET_EXERCISE_THEME).catch(() => false);
+  }, { targetTheme: TARGET_EXERCISE_THEME, skipList: skippedKeys }).catch(() => false);
 
   if (!result?.ok) {
     const samples = Array.isArray(result?.samples) && result.samples.length
@@ -544,6 +626,7 @@ async function clickFirstPendingExerciseTheme() {
     console.log(`URL atual: ${page.url()}`);
     await shutdownAndExit();
   }
+  return result;
 }
 
 async function hideExercisesSidebar() {
@@ -1122,6 +1205,7 @@ async function saveLastRead() {
 
 async function savePromptForChat(options = {}) {
   const shouldFinalize = options.finalize ?? startMode === 'avaliacao';
+  const exerciseReturnUrl = options.exerciseReturnUrl || '';
   lastRead = await collectExam();
   printReadSummary(lastRead);
 
@@ -1139,7 +1223,7 @@ async function savePromptForChat(options = {}) {
     if (parsed.length > 0) {
       await writeFile(ANSWERS_TEXT_FILE, `${formatAnswers(parsed)}\n`, 'utf8');
       debugLog(`Respostas detectadas e salvas em ${ANSWERS_TEXT_FILE}`);
-      await applyParsedAnswers(parsed, { finalize: shouldFinalize });
+      await applyParsedAnswers(parsed, { finalize: shouldFinalize, exerciseReturnUrl });
     } else {
       debugLog(`Texto salvo em ${CHATGPT_PAGE_TEXT_FILE}, mas nao encontrei sequencia de respostas.`);
     }
@@ -1456,6 +1540,7 @@ async function applyAnswerList(args) {
 
 async function applyParsedAnswers(answers, options = {}) {
   const shouldFinalize = options.finalize ?? true;
+  const exerciseReturnUrl = options.exerciseReturnUrl || '';
   if (!answers.length) throw new Error('nao encontrei respostas para marcar');
 
   await focusExamBrowserWindow();
@@ -1482,7 +1567,7 @@ async function applyParsedAnswers(answers, options = {}) {
     }
 
     debugLog(`Exercicio respondido automaticamente (${markedCount}/${answers.length}).`);
-    await finishExerciseAndRestart();
+    await finishExerciseAndReturnToList(exerciseReturnUrl);
     return;
   }
 
@@ -1610,7 +1695,7 @@ async function isQuestionAnsweredWithLetter(questionNumber, letter) {
   })()`).catch(() => false);
 }
 
-async function finishExerciseAndRestart() {
+async function finishExerciseAndReturnToList(returnToListUrl = '') {
   await focusExamBrowserWindow();
   await page.bringToFront().catch(() => {});
   await page.waitForTimeout(800);
@@ -1671,8 +1756,12 @@ async function finishExerciseAndRestart() {
     await page.waitForTimeout(1500);
   }
 
-  await openUrl(DEFAULT_SITE_URL);
-  await openExercisesFromHome();
+  const targetUrl = returnToListUrl || currentExerciseListUrl;
+  if (targetUrl) {
+    currentExerciseListUrl = targetUrl;
+    await page.goto(targetUrl, { waitUntil: 'domcontentloaded' });
+    await page.waitForTimeout(1000);
+  }
 }
 
 async function clickButtonByNormalizedText(targetText) {
@@ -2718,7 +2807,7 @@ async function runPromptAutomaticallyAfterExamStart() {
   await savePromptForChat({ finalize: true });
 }
 
-async function runExercisePromptAutomaticallyAfterStart() {
+async function runExercisePromptAutomaticallyAfterStart(options = {}) {
   const ready = await waitForExamQuestionsReady(30000);
   if (!ready) {
     debugLog('Exercicio aberto, mas ainda nao encontrei as questoes para gerar o prompt automaticamente.');
@@ -2726,7 +2815,7 @@ async function runExercisePromptAutomaticallyAfterStart() {
   }
 
   debugLog('Questoes do exercicio carregadas. Vou executar o comando prompt automaticamente.');
-  await savePromptForChat({ finalize: false });
+  await savePromptForChat({ finalize: false, exerciseReturnUrl: options.returnToListUrl || currentExerciseListUrl });
 }
 
 async function waitForExamQuestionsReady(totalTimeoutMs) {
